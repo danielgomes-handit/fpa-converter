@@ -10,8 +10,10 @@ para que o orchestrator só acione os agentes relevantes.
 from __future__ import annotations
 
 import base64
+import io
 import json
 import os
+import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Dict, List
@@ -84,6 +86,147 @@ def _document_blocks(path: Path, file_kind: FileKind) -> List[Dict[str, Any]]:
 
 
 # =============================================================================
+# Chunking: divide documento grande em pedaços menores
+# =============================================================================
+
+def _pdf_chunks(path: Path, pages_per_chunk: int = 3) -> List[List[Dict[str, Any]]]:
+    """Divide PDF em chunks de N páginas cada."""
+    try:
+        from pypdf import PdfReader, PdfWriter
+    except ImportError:
+        # Sem pypdf, retorna o PDF inteiro como único chunk
+        return [_document_blocks(path, FileKind.PDF_WITH_TEXT)]
+
+    reader = PdfReader(str(path))
+    total_pages = len(reader.pages)
+
+    if total_pages <= pages_per_chunk:
+        return [_document_blocks(path, FileKind.PDF_WITH_TEXT)]
+
+    chunks: List[List[Dict[str, Any]]] = []
+    for start in range(0, total_pages, pages_per_chunk):
+        end = min(start + pages_per_chunk, total_pages)
+        writer = PdfWriter()
+        for i in range(start, end):
+            writer.add_page(reader.pages[i])
+
+        buf = io.BytesIO()
+        writer.write(buf)
+        pdf_bytes = buf.getvalue()
+
+        chunks.append([
+            {
+                "type": "text",
+                "text": f"Esta é a parte {len(chunks) + 1} do documento "
+                        f"(páginas {start + 1} a {end} de {total_pages}).",
+            },
+            {
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": base64.standard_b64encode(pdf_bytes).decode("utf-8"),
+                },
+            },
+        ])
+    return chunks
+
+
+def _tabular_chunks(path: Path, rows_per_chunk: int = 60) -> List[List[Dict[str, Any]]]:
+    """Divide xlsx/csv em chunks de N linhas cada."""
+    import pandas as pd
+
+    try:
+        if path.suffix.lower() in {".xlsx", ".xlsm"}:
+            xls = pd.ExcelFile(path)
+            sheets_data = {}
+            for sheet_name in xls.sheet_names:
+                try:
+                    df = xls.parse(sheet_name)
+                    if not df.empty and df.shape[1] > 0:
+                        sheets_data[sheet_name] = df
+                except Exception:
+                    continue
+        else:
+            sep = "\t" if path.suffix.lower() == ".tsv" else ","
+            df = pd.read_csv(path, sep=sep, dtype=str)
+            sheets_data = {path.stem: df}
+    except Exception:
+        return [_document_blocks(path, FileKind.TABULAR_STRUCTURED)]
+
+    if not sheets_data:
+        return [_document_blocks(path, FileKind.TABULAR_STRUCTURED)]
+
+    # Monta chunks, iterando cada sheet e fatiando em rows_per_chunk
+    chunks: List[List[Dict[str, Any]]] = []
+    total_rows_across = sum(len(df) for df in sheets_data.values())
+
+    if total_rows_across <= rows_per_chunk:
+        # Cabe tudo em 1 chunk, manda normal
+        return [_document_blocks(path, FileKind.TABULAR_STRUCTURED)]
+
+    for sheet_name, df in sheets_data.items():
+        sheet_total = len(df)
+        cols = list(df.columns)
+
+        for start in range(0, sheet_total, rows_per_chunk):
+            end = min(start + rows_per_chunk, sheet_total)
+            chunk_df = df.iloc[start:end]
+            try:
+                md_table = chunk_df.to_markdown(index=False)
+            except Exception:
+                md_table = chunk_df.to_string(index=False)
+
+            preamble_txt = (
+                f"# Arquivo: `{path.name}`\n"
+                f"## Aba: `{sheet_name}` — linhas {start + 1} a {end} de {sheet_total}\n"
+                f"### Colunas: {cols}\n\n"
+            )
+            chunks.append([{
+                "type": "text",
+                "text": preamble_txt + md_table,
+            }])
+
+    return chunks if chunks else [_document_blocks(path, FileKind.TABULAR_STRUCTURED)]
+
+
+def _text_chunks(path: Path, chars_per_chunk: int = 8000) -> List[List[Dict[str, Any]]]:
+    """Divide texto em chunks de N chars."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if len(text) <= chars_per_chunk:
+        return [[{"type": "text", "text": f"```\n{text}\n```"}]]
+
+    chunks: List[List[Dict[str, Any]]] = []
+    total = len(text)
+    for start in range(0, total, chars_per_chunk):
+        end = min(start + chars_per_chunk, total)
+        chunks.append([{
+            "type": "text",
+            "text": f"Parte {len(chunks) + 1} (chars {start + 1}-{end} de {total}):\n\n"
+                    f"```\n{text[start:end]}\n```",
+        }])
+    return chunks
+
+
+def _document_chunks(
+    path: Path,
+    file_kind: FileKind,
+    pdf_pages_per_chunk: int = 3,
+    tabular_rows_per_chunk: int = 60,
+    text_chars_per_chunk: int = 8000,
+) -> List[List[Dict[str, Any]]]:
+    """Retorna lista de chunks (cada chunk é uma lista de blocks para o Claude)."""
+    if file_kind in {FileKind.PDF_WITH_TEXT, FileKind.PDF_SCANNED}:
+        return _pdf_chunks(path, pdf_pages_per_chunk)
+    if file_kind in {FileKind.TABULAR_STRUCTURED, FileKind.TABULAR_MESSY}:
+        return _tabular_chunks(path, tabular_rows_per_chunk)
+    if file_kind == FileKind.TEXT_FREEFORM:
+        return _text_chunks(path, text_chars_per_chunk)
+    # IMAGE e outros: chunk único
+    return [_document_blocks(path, file_kind)]
+
+
+# =============================================================================
 # Classe base Agent
 # =============================================================================
 
@@ -144,6 +287,15 @@ class Agent(ABC):
         """Campo chave para detectar duplicatas."""
         return ""
 
+    def schema_fields(self) -> List[str]:
+        """Campos que vão no schema do tool.
+
+        Por padrão, retorna TODOS os campos da estrutura (modelo completo).
+        Subclasses podem override para economizar tokens em casos específicos.
+        Campos omitidos pelo Claude são preenchidos com "" na normalização.
+        """
+        return list(self.structure.all_fields)
+
     # ---------------------------------------------------------------------
     # Pipeline
     # ---------------------------------------------------------------------
@@ -153,8 +305,9 @@ class Agent(ABC):
         return get_structure(self.structure_id)
 
     def tool_schema(self) -> Dict[str, Any]:
-        """Schema enxuto: só os nomes dos campos, sem descrições (economiza tokens)."""
+        """Schema enxuto: só os campos essenciais (economia de tokens)."""
         s = self.structure
+        fields_for_schema = self.schema_fields()
         return {
             "name": f"submit_{self.structure_id}",
             "description": f"Submete registros de {s.label}.",
@@ -166,8 +319,8 @@ class Agent(ABC):
                         "items": {
                             "type": "object",
                             "properties": {
-                                f.name: {"type": "string"}
-                                for f in s.fields
+                                field_name: {"type": "string"}
+                                for field_name in fields_for_schema
                             },
                         },
                     },
@@ -202,35 +355,103 @@ class Agent(ABC):
         return {"records": [], "_meta": {"stop_reason": "no_tool_use"}}
 
     def extract(self) -> List[Dict[str, Any]]:
-        """Primeira extração focada na estrutura."""
-        self._notify(f"Extraindo {self.structure.label}... (pode levar 1-3 min)")
-        doc_blocks = _document_blocks(self.source_path, self.file_kind)
+        """Extração com chunking: processa o documento em pedaços menores.
+
+        Entre chunks aguarda `CLAUDE_RATE_LIMIT_WAIT_SECONDS` (padrão 60s) para
+        respeitar o rate limit output TPM da Anthropic.
+        """
+        chunks = _document_chunks(self.source_path, self.file_kind)
+        total_chunks = len(chunks)
+
+        all_records: List[Dict[str, Any]] = []
+        seen_keys: set = set()
+        kf = self.key_field()
+        rate_wait = int(os.environ.get("CLAUDE_RATE_LIMIT_WAIT_SECONDS", "60"))
 
         required_fields = self.structure.required_fields
-        preamble = (
-            f"Você vai extrair APENAS registros da estrutura **{self.structure.label}** "
-            f"deste documento. Outras estruturas serão processadas por outros agentes, "
-            f"não se preocupe com elas.\n\n"
-            f"**ECONOMIA DE TOKENS (IMPORTANTE):**\n"
-            f"- OMITA campos sem valor no JSON. Só inclua as chaves que têm dado real.\n"
-            f"- Campos obrigatórios que DEVEM sempre aparecer: {', '.join(required_fields)}\n"
-            f"- Campos opcionais: só os que o documento preencher explicitamente.\n\n"
-            f"{self.extract_instructions()}\n\n"
-            f"Contexto do cliente: {self.client_context or '(nenhum)'}\n\n"
-            f"Use a ferramenta `submit_{self.structure_id}` para retornar os registros."
-        )
 
-        content = [{"type": "text", "text": preamble}] + doc_blocks
-        result = self._call_claude(content)
-        records = result.get("records", [])
+        for i, chunk_blocks in enumerate(chunks, 1):
+            if total_chunks > 1:
+                self._notify(
+                    f"Extraindo {self.structure.label} — parte {i}/{total_chunks}..."
+                )
+            else:
+                self._notify(f"Extraindo {self.structure.label}... (pode levar 1-3 min)")
 
-        self.log.append({
-            "step": "extract",
-            "records_count": len(records),
-            "meta": result.get("_meta", {}),
-            "notes": result.get("notes", ""),
-        })
-        return records
+            preamble = (
+                f"Você vai extrair APENAS registros da estrutura "
+                f"**{self.structure.label}** desta "
+                + (f"parte {i}/{total_chunks} do " if total_chunks > 1 else "")
+                + f"documento. Outras estruturas serão processadas por outros agentes.\n\n"
+                + (
+                    f"**Parte {i} de {total_chunks}**: extraia apenas o que for "
+                    f"visível nesta parte. Registros que aparecerem também em "
+                    f"outras partes serão automaticamente deduplicados depois.\n\n"
+                    if total_chunks > 1 else ""
+                )
+                + "**ECONOMIA DE TOKENS (IMPORTANTE):**\n"
+                "- OMITA campos sem valor no JSON. Só inclua as chaves que têm dado real.\n"
+                f"- Campos obrigatórios que DEVEM sempre aparecer: {', '.join(required_fields)}\n"
+                "- Campos opcionais: só os que o documento preencher explicitamente.\n\n"
+                f"{self.extract_instructions()}\n\n"
+                f"Contexto do cliente: {self.client_context or '(nenhum)'}\n\n"
+                f"Use a ferramenta `submit_{self.structure_id}` para retornar os registros."
+            )
+
+            content = [{"type": "text", "text": preamble}] + chunk_blocks
+
+            try:
+                result = self._call_claude(content)
+            except Exception as e:
+                self.log.append({
+                    "step": f"extract_chunk_{i}",
+                    "error": str(e),
+                    "chunk_index": i,
+                    "total_chunks": total_chunks,
+                })
+                # Se ainda tem mais chunks, tenta próximo após wait
+                if i < total_chunks and rate_wait > 0:
+                    self._notify(
+                        f"Erro no chunk {i}. Aguardando {rate_wait}s e tentando chunk {i+1}..."
+                    )
+                    time.sleep(rate_wait)
+                continue
+
+            records = result.get("records", [])
+
+            # Deduplicação por key_field
+            new_records: List[Dict[str, Any]] = []
+            for rec in records:
+                if kf:
+                    key_val = str(rec.get(kf, "")).strip()
+                    if key_val:
+                        if key_val in seen_keys:
+                            continue
+                        seen_keys.add(key_val)
+                new_records.append(rec)
+
+            all_records.extend(new_records)
+
+            self.log.append({
+                "step": f"extract_chunk_{i}" if total_chunks > 1 else "extract",
+                "chunk_index": i,
+                "total_chunks": total_chunks,
+                "records_from_chunk": len(records),
+                "records_after_dedup": len(new_records),
+                "cumulative_records": len(all_records),
+                "meta": result.get("_meta", {}),
+                "notes": result.get("notes", ""),
+            })
+
+            # Rate limit: aguardar antes do próximo chunk
+            if i < total_chunks and rate_wait > 0:
+                self._notify(
+                    f"Chunk {i}/{total_chunks} OK ({len(all_records)} registros até agora). "
+                    f"Aguardando {rate_wait}s para rate limit..."
+                )
+                time.sleep(rate_wait)
+
+        return all_records
 
     def validate(self, records: List[Dict[str, Any]]) -> List[str]:
         """Validações básicas + customizadas. Retorna lista de issues."""
@@ -272,31 +493,57 @@ class Agent(ABC):
         records: List[Dict[str, Any]],
         issues: List[str],
     ) -> List[Dict[str, Any]]:
-        """Pede ao Claude para revisar e refinar os registros."""
+        """Pede ao Claude para revisar e refinar os registros.
+
+        Estratégia para evitar estourar rate limits:
+        - Se há muitos registros (>40), não reprocessa todos: só registra issues como alertas.
+        - Não inclui o documento original na revisão (só registros + issues).
+        """
         if not issues:
             return records
 
+        # Se muitos registros, pular self_review completo para não estourar tokens.
+        # Os issues ficam registrados e aparecem no UI para decisão humana.
+        MAX_RECORDS_FOR_REVIEW = int(
+            os.environ.get("CLAUDE_SELF_REVIEW_MAX_RECORDS", "40")
+        )
+        if len(records) > MAX_RECORDS_FOR_REVIEW:
+            self.log.append({
+                "step": "self_review_skipped",
+                "reason": f"{len(records)} registros > limite {MAX_RECORDS_FOR_REVIEW}",
+                "issues_count": len(issues),
+            })
+            return records
+
         self._notify(
-            f"Revisando {self.structure.label} ({len(issues)} alertas)... (pode levar mais 1-3 min)"
+            f"Revisando {self.structure.label} ({len(issues)} alertas)..."
         )
         records_json = json.dumps(records, indent=2, ensure_ascii=False)
         issues_text = "\n".join(f"- {i}" for i in issues[:25])
 
         review_prompt = (
             f"Você extraiu estes registros de {self.structure.label}:\n\n"
-            f"```json\n{records_json[:20000]}\n```\n\n"
+            f"```json\n{records_json[:12000]}\n```\n\n"
             f"A validação automática detectou problemas:\n\n{issues_text}\n\n"
-            f"Revise os registros e corrija o que for possível SEM inventar dados "
-            f"que não existam no documento original. Se algum problema for uma "
-            f"limitação real do documento, mantenha como está e registre em `notes`.\n\n"
+            f"Revise os registros e corrija o que for possível. Se algum problema "
+            f"for uma limitação real do documento original, mantenha como está e "
+            f"registre em `notes`. NÃO invente dados.\n\n"
+            f"**ECONOMIA DE TOKENS**: omita campos vazios no JSON.\n\n"
             f"Retorne a versão revisada usando `submit_{self.structure_id}`."
         )
 
-        # O documento original precisa ir junto para o Claude re-consultar se quiser
-        doc_blocks = _document_blocks(self.source_path, self.file_kind)
-        content = [{"type": "text", "text": review_prompt}] + doc_blocks
+        content = [{"type": "text", "text": review_prompt}]
 
-        result = self._call_claude(content)
+        try:
+            result = self._call_claude(content)
+        except Exception as e:
+            self.log.append({
+                "step": "self_review_error",
+                "error": str(e),
+                "issues_count": len(issues),
+            })
+            return records
+
         refined = result.get("records", records)
 
         self.log.append({
