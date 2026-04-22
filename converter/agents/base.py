@@ -10,18 +10,20 @@ para que o orchestrator só acione os agentes relevantes.
 from __future__ import annotations
 
 import base64
+import csv
 import io
 import json
 import os
 import time
 from abc import ABC, abstractmethod
+from io import StringIO
 from pathlib import Path
 from typing import Any, Dict, List
 
 from anthropic import Anthropic
 
 from ..router import FileKind
-from ..schemas import ALL_STRUCTURES, get_structure
+from ..schemas import ALL_STRUCTURES, StructureSpec, get_structure
 
 
 # =============================================================================
@@ -227,6 +229,43 @@ def _document_chunks(
 
 
 # =============================================================================
+# Parser CSV (Claude retorna CSV para economizar tokens vs JSON)
+# =============================================================================
+
+def _parse_csv_records(csv_text: str, structure: StructureSpec) -> List[Dict[str, str]]:
+    """Parseia string CSV em lista de dicts.
+
+    Tolera diferenças de case nos nomes de coluna e ignora colunas
+    que não pertencem ao schema da estrutura.
+    """
+    if not csv_text or not csv_text.strip():
+        return []
+
+    all_fields = {f.upper(): f for f in structure.all_fields}
+    records: List[Dict[str, str]] = []
+
+    try:
+        reader = csv.DictReader(StringIO(csv_text.strip()))
+        for row in reader:
+            if not row:
+                continue
+            rec: Dict[str, str] = {}
+            for k, v in row.items():
+                if k is None:
+                    continue
+                k_norm = str(k).strip().upper()
+                if k_norm in all_fields:
+                    original_name = all_fields[k_norm]
+                    rec[original_name] = str(v or "").strip()
+            if rec:
+                records.append(rec)
+    except Exception:
+        return []
+
+    return records
+
+
+# =============================================================================
 # Classe base Agent
 # =============================================================================
 
@@ -305,33 +344,43 @@ class Agent(ABC):
         return get_structure(self.structure_id)
 
     def tool_schema(self) -> Dict[str, Any]:
-        """Schema enxuto: só os campos essenciais (economia de tokens)."""
+        """Schema CSV: Claude retorna string CSV em vez de array de objects.
+
+        Motivo: JSON com N objetos × 19 chaves repetidas consome ~10x mais tokens
+        que um CSV com header + linhas. Para escapar do rate limit Tier 1 (8k TPM
+        output), CSV é muito mais eficiente.
+        """
         s = self.structure
         fields_for_schema = self.schema_fields()
+        required_fields = [f for f in s.required_fields if f in fields_for_schema]
         return {
             "name": f"submit_{self.structure_id}",
-            "description": f"Submete registros de {s.label}.",
+            "description": f"Submete registros de {s.label} em formato CSV.",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "records": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                field_name: {"type": "string"}
-                                for field_name in fields_for_schema
-                            },
-                        },
+                    "records_csv": {
+                        "type": "string",
+                        "description": (
+                            f"String CSV com header na primeira linha e um registro "
+                            f"por linha. Separador: vírgula. "
+                            f"Colunas disponíveis (na ordem): {','.join(fields_for_schema)}. "
+                            f"Colunas obrigatórias que devem sempre ter valor: "
+                            f"{','.join(required_fields)}. "
+                            f"Use aspas duplas em valores que contenham vírgula, quebra de "
+                            f"linha ou aspas. Deixe células vazias quando o documento não "
+                            f"fornecer o dado (não invente). Exemplo de formato:\\n"
+                            f"COL1,COL2,COL3\\nvalor1,\\\"valor com, vírgula\\\",valor3"
+                        ),
                     },
                     "notes": {"type": "string"},
                 },
-                "required": ["records"],
+                "required": ["records_csv"],
             },
         }
 
     def _call_claude(self, user_content: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Chama Claude com streaming e retorna o tool_use input."""
+        """Chama Claude com streaming e retorna records parseados do CSV."""
         tool = self.tool_schema()
         with self.client.messages.stream(
             model=self.model,
@@ -343,16 +392,26 @@ class Agent(ABC):
         ) as stream:
             final = stream.get_final_message()
 
+        meta = {
+            "stop_reason": final.stop_reason,
+            "input_tokens": final.usage.input_tokens,
+            "output_tokens": final.usage.output_tokens,
+        }
+
         for block in final.content:
             if block.type == "tool_use" and block.name == tool["name"]:
-                result = dict(block.input)
-                result["_meta"] = {
-                    "stop_reason": final.stop_reason,
-                    "input_tokens": final.usage.input_tokens,
-                    "output_tokens": final.usage.output_tokens,
+                input_data = dict(block.input)
+                csv_text = input_data.get("records_csv", "") or ""
+                records = _parse_csv_records(csv_text, self.structure)
+                return {
+                    "records": records,
+                    "notes": input_data.get("notes", ""),
+                    "_csv_preview": csv_text[:500],
+                    "_csv_length": len(csv_text),
+                    "_meta": meta,
                 }
-                return result
-        return {"records": [], "_meta": {"stop_reason": "no_tool_use"}}
+
+        return {"records": [], "notes": "", "_meta": dict(meta, stop_reason="no_tool_use")}
 
     def extract(self) -> List[Dict[str, Any]]:
         """Extração com chunking: processa o documento em pedaços menores.
@@ -389,13 +448,21 @@ class Agent(ABC):
                     f"outras partes serão automaticamente deduplicados depois.\n\n"
                     if total_chunks > 1 else ""
                 )
-                + "**ECONOMIA DE TOKENS (IMPORTANTE):**\n"
-                "- OMITA campos sem valor no JSON. Só inclua as chaves que têm dado real.\n"
-                f"- Campos obrigatórios que DEVEM sempre aparecer: {', '.join(required_fields)}\n"
-                "- Campos opcionais: só os que o documento preencher explicitamente.\n\n"
+                + "**FORMATO DE RESPOSTA (CRÍTICO):**\n"
+                "Retorne os registros em CSV (Comma-Separated Values) dentro do "
+                "campo `records_csv`. NÃO use JSON/objeto. O CSV é muito mais eficiente "
+                "em tokens, permitindo extrair centenas de registros de uma vez.\n\n"
+                f"- Primeira linha: header com os nomes das colunas separados por vírgula.\n"
+                f"- Uma linha por registro.\n"
+                f"- Deixe células VAZIAS (nada entre as vírgulas) quando o documento "
+                f"não fornecer o valor. Ex.: `1.1.1.01,,Caixa,D`\n"
+                f"- Use aspas duplas em valores com vírgula ou quebra de linha. "
+                f"Ex.: `1010,,\"Caixa, Agência Centro\",D`\n"
+                f"- Campos obrigatórios que DEVEM sempre ter valor: "
+                f"{', '.join(required_fields)}\n\n"
                 f"{self.extract_instructions()}\n\n"
                 f"Contexto do cliente: {self.client_context or '(nenhum)'}\n\n"
-                f"Use a ferramenta `submit_{self.structure_id}` para retornar os registros."
+                f"Use a ferramenta `submit_{self.structure_id}` com `records_csv` preenchido."
             )
 
             content = [{"type": "text", "text": preamble}] + chunk_blocks
@@ -528,7 +595,9 @@ class Agent(ABC):
             f"Revise os registros e corrija o que for possível. Se algum problema "
             f"for uma limitação real do documento original, mantenha como está e "
             f"registre em `notes`. NÃO invente dados.\n\n"
-            f"**ECONOMIA DE TOKENS**: omita campos vazios no JSON.\n\n"
+            f"**FORMATO DE RESPOSTA**: retorne em CSV via `records_csv` (igual ao "
+            f"extract). Header na 1ª linha + uma linha por registro. "
+            f"Deixe células vazias quando não houver dado.\n\n"
             f"Retorne a versão revisada usando `submit_{self.structure_id}`."
         )
 

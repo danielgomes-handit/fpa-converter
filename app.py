@@ -399,6 +399,27 @@ if st.session_state.orchestration and st.session_state.zip_bytes:
             for a in all_alerts:
                 st.markdown(f"- {a}")
 
+    # Preview dos arquivos gerados
+    if orchestration.dfs:
+        st.subheader("Prévia dos arquivos gerados")
+        st.caption(
+            "Primeiras 5 linhas de cada estrutura. O xlsx completo está no zip abaixo."
+        )
+        tab_labels = [get_structure(sid).label for sid in orchestration.dfs]
+        tabs = st.tabs(tab_labels)
+        for tab, (sid, df) in zip(tabs, orchestration.dfs.items()):
+            with tab:
+                total = len(df)
+                st.markdown(
+                    f"**{total} registro{'s' if total != 1 else ''}** "
+                    f"· exibindo as primeiras {min(5, total)} linhas"
+                )
+                st.dataframe(
+                    df.head(5),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
     with st.expander("Ver passos executados por cada agente (debug)"):
         st.json(orchestration.to_debug_dict())
 
