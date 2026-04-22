@@ -106,6 +106,7 @@ class Agent(ABC):
         client_context: str = "",
         api_key: str | None = None,
         model: str | None = None,
+        progress_callback=None,
     ):
         self.source_path = Path(source_path)
         self.file_kind = file_kind
@@ -113,8 +114,15 @@ class Agent(ABC):
         self.api_key = api_key or os.environ["ANTHROPIC_API_KEY"]
         self.model = model or os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
         self.max_tokens = int(os.environ.get("CLAUDE_MAX_TOKENS", "16384"))
-        self.client = Anthropic(api_key=self.api_key)
+        self.timeout = int(os.environ.get("CLAUDE_TIMEOUT_SECONDS", "180"))
+        # timeout=180 = 3 minutos por chamada. Se passar, lança exceção.
+        self.client = Anthropic(api_key=self.api_key, timeout=self.timeout)
         self.log: List[Dict[str, Any]] = []
+        self.progress_callback = progress_callback
+
+    def _notify(self, label: str):
+        if self.progress_callback:
+            self.progress_callback(label)
 
     # ---------------------------------------------------------------------
     # A implementar por cada subclasse
@@ -205,6 +213,7 @@ class Agent(ABC):
 
     def extract(self) -> List[Dict[str, Any]]:
         """Primeira extração focada na estrutura."""
+        self._notify(f"Extraindo {self.structure.label}... (pode levar 1-3 min)")
         doc_blocks = _document_blocks(self.source_path, self.file_kind)
         preamble = (
             f"Você vai extrair APENAS registros da estrutura **{self.structure.label}** "
@@ -271,6 +280,9 @@ class Agent(ABC):
         if not issues:
             return records
 
+        self._notify(
+            f"Revisando {self.structure.label} ({len(issues)} alertas)... (pode levar mais 1-3 min)"
+        )
         records_json = json.dumps(records, indent=2, ensure_ascii=False)
         issues_text = "\n".join(f"- {i}" for i in issues[:25])
 

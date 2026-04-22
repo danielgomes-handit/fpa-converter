@@ -91,12 +91,13 @@ def run_orchestration(
             continue
 
         structure = get_structure(sid)
-        _notify(f"Processando {structure.label}...")
+        _notify(f"Iniciando agente de {structure.label}...")
 
         agent = agent_cls(
             source_path=source_path,
             file_kind=file_kind,
             client_context=client_context,
+            progress_callback=progress_callback,
         )
         try:
             output = agent.run()
