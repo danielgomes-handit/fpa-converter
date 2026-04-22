@@ -1,0 +1,42 @@
+Arquivo de teste criado pelo Claude.
+
+Se você está conseguindo ler este arquivo, a sincronização do Google Drive está
+funcionando e TODOS os outros arquivos também estão na pasta.
+
+Se a pasta parece vazia mesmo que este arquivo exista na nuvem, é questão de
+sincronização local do Google Drive Desktop.
+
+Estrutura completa que foi criada:
+
+fpa-converter/
+├── .env.example
+├── .gitignore
+├── .streamlit/
+│   ├── config.toml
+│   └── secrets.toml.example
+├── DEPLOY.md
+├── GUIA_PASSO_A_PASSO.md
+├── README.md
+├── TESTE_SINCRONIZACAO.txt  <-- ESTE ARQUIVO
+├── app.py                   (arquitetura multi-agente)
+├── requirements.txt
+└── converter/
+    ├── __init__.py
+    ├── agents/
+    │   ├── __init__.py
+    │   ├── base.py          (classe Agent + Triager)
+    │   └── specialized.py   (4 agentes)
+    ├── analyzer.py
+    ├── extractor.py
+    ├── mapper.py
+    ├── orchestrator.py      (NOVO)
+    ├── reporter.py
+    ├── router.py
+    ├── schemas.py
+    ├── transformer.py
+    └── validator.py
+
+Se este arquivo está em branco ou não aparece, tente:
+1. Clicar com botão direito na pasta fpa-converter no Windows Explorer
+2. Escolher "Disponibilizar off-line" (Google Drive Desktop)
+3. Aguardar o download completar (ícone de nuvem vira check verde)

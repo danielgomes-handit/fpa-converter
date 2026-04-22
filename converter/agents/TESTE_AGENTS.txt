@@ -1,0 +1,8 @@
+Este arquivo está em G:\Meu Drive\fpa-converter\converter\agents\
+Se voce vê este arquivo, a pasta agents/ está sincronizada.
+
+Arquivos que DEVEM estar nesta pasta:
+- __init__.py
+- base.py (16 KB, classe Agent + Triager)
+- specialized.py (18 KB, 4 agentes especializados)
+- TESTE_AGENTS.txt (este arquivo)
