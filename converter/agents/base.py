@@ -335,6 +335,10 @@ class Agent(ABC):
         """
         return records
 
+    def extra_chunk_instruction(self) -> str:
+        """Instrução extra colocada em CADA chunk. Override opcional."""
+        return ""
+
     def schema_fields(self) -> List[str]:
         """Campos que vão no schema do tool.
 
@@ -470,8 +474,9 @@ class Agent(ABC):
                 f"- Campos obrigatórios que DEVEM sempre ter valor: "
                 f"{', '.join(required_fields)}\n\n"
                 f"{self.extract_instructions()}\n\n"
-                f"Contexto do cliente: {self.client_context or '(nenhum)'}\n\n"
-                f"Use a ferramenta `submit_{self.structure_id}` com `records_csv` preenchido."
+                + (f"{self.extra_chunk_instruction()}\n\n" if self.extra_chunk_instruction() else "")
+                + f"Contexto do cliente: {self.client_context or '(nenhum)'}\n\n"
+                + f"Use a ferramenta `submit_{self.structure_id}` com `records_csv` preenchido."
             )
 
             content = [{"type": "text", "text": preamble}] + chunk_blocks

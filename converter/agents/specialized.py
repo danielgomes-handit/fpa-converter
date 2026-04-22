@@ -209,6 +209,26 @@ class PlanoDeContasAgent(Agent):
             "limite de output, registre em `notes` quantas ficaram de fora."
         )
 
+    def extra_chunk_instruction(self) -> str:
+        return (
+            "⚠️ REFORÇO SOBRE SINTÉTICAS (muito importante):\n"
+            "Em CADA parte/chunk do documento que você processar, SEMPRE inclua como "
+            "linhas do CSV as contas sintéticas (totalizadoras) que sejam pais das "
+            "contas analíticas dessa parte — mesmo que você ache que já mandou em "
+            "outra parte. Não tem problema repetir: a deduplicação é automática.\n\n"
+            "Exemplo: se esta parte tem as analíticas '1.1.2.01 Banco X' e "
+            "'1.1.2.02 Banco Y', você DEVE também incluir as linhas:\n"
+            "  1,ATIVO,...\n"
+            "  1.1,ATIVO CIRCULANTE,...\n"
+            "  1.1.2,BANCOS - CONTA MOVIMENTO,...\n"
+            "  1.1.2.01,Banco X,...\n"
+            "  1.1.2.02,Banco Y,...\n\n"
+            "Sem as linhas das sintéticas, a hierarquia CONTA_N1..N5 não consegue "
+            "ser reconstruída com os nomes corretos. Se o documento não mostra o "
+            "nome da sintética pai, deixe a DESC vazia (não invente), mas mande a "
+            "linha com o código mesmo assim."
+        )
+
     def post_process(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Pós-processamento determinístico após extração do Claude.
 
