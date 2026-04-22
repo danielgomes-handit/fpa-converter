@@ -153,35 +153,25 @@ class Agent(ABC):
         return get_structure(self.structure_id)
 
     def tool_schema(self) -> Dict[str, Any]:
+        """Schema enxuto: só os nomes dos campos, sem descrições (economiza tokens)."""
         s = self.structure
         return {
             "name": f"submit_{self.structure_id}",
-            "description": f"Submete registros de {s.label} extraídos do documento.",
+            "description": f"Submete registros de {s.label}.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "records": {
                         "type": "array",
-                        "description": f"Lista de registros de {s.label}. "
-                                       "Inclua todos os encontrados no documento.",
                         "items": {
                             "type": "object",
                             "properties": {
-                                f.name: {
-                                    "type": "string",
-                                    "description": f.description + (
-                                        f" Formato: {f.format_hint}." if f.format_hint else ""
-                                    ),
-                                }
+                                f.name: {"type": "string"}
                                 for f in s.fields
                             },
                         },
                     },
-                    "notes": {
-                        "type": "string",
-                        "description": "Observações sobre a extração: campos ausentes, "
-                                       "decisões tomadas, limitações do documento.",
-                    },
+                    "notes": {"type": "string"},
                 },
                 "required": ["records"],
             },
@@ -215,10 +205,16 @@ class Agent(ABC):
         """Primeira extração focada na estrutura."""
         self._notify(f"Extraindo {self.structure.label}... (pode levar 1-3 min)")
         doc_blocks = _document_blocks(self.source_path, self.file_kind)
+
+        required_fields = self.structure.required_fields
         preamble = (
             f"Você vai extrair APENAS registros da estrutura **{self.structure.label}** "
             f"deste documento. Outras estruturas serão processadas por outros agentes, "
             f"não se preocupe com elas.\n\n"
+            f"**ECONOMIA DE TOKENS (IMPORTANTE):**\n"
+            f"- OMITA campos sem valor no JSON. Só inclua as chaves que têm dado real.\n"
+            f"- Campos obrigatórios que DEVEM sempre aparecer: {', '.join(required_fields)}\n"
+            f"- Campos opcionais: só os que o documento preencher explicitamente.\n\n"
             f"{self.extract_instructions()}\n\n"
             f"Contexto do cliente: {self.client_context or '(nenhum)'}\n\n"
             f"Use a ferramenta `submit_{self.structure_id}` para retornar os registros."
