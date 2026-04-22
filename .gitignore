@@ -11,3 +11,9 @@ __pycache__/
 *.log
 outputs_temp/
 _b64/
+
+# Pasta com assets brutos da marca (não vai pro repo; só os usados em assets/)
+Visual/
+
+# Arquivos de teste
+TESTE_*.txt

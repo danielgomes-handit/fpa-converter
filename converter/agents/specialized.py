@@ -204,6 +204,68 @@ class PlanoDeContasAgent(Agent):
             "exceder o limite de output, registre em `notes` quantas ficaram de fora."
         )
 
+    def post_process(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Pós-processamento determinístico após extração do Claude.
+
+        1. Remove contas sintéticas (códigos que são prefixo de algum outro código).
+        2. Corrige hierarquia CONTA_N*_COD/DESC baseado no próprio código.
+        """
+        code_pattern = re.compile(r"^[\d.]+$")
+
+        # 1) Filtrar sintéticas: uma conta é sintética se EXISTE outra conta cujo
+        #    código começa com o código dela + ".". Ex.: "1.1.1" é sintética se
+        #    existe "1.1.1.01" ou "1.1.1.02" nos registros.
+        all_codes = set()
+        for rec in records:
+            cod = str(rec.get("CONTA_CONTABIL_COD", "")).strip()
+            if cod:
+                all_codes.add(cod)
+
+        def _is_synthetic(code: str) -> bool:
+            if not code:
+                return False
+            prefix = code + "."
+            return any(other.startswith(prefix) for other in all_codes if other != code)
+
+        # Mapa código → descrição (para preencher CONTA_N*_DESC)
+        code_to_desc: Dict[str, str] = {}
+        for rec in records:
+            cod = str(rec.get("CONTA_CONTABIL_COD", "")).strip()
+            desc = str(rec.get("CONTA_CONTABIL_DESC", "")).strip()
+            if cod and desc:
+                code_to_desc[cod] = desc
+
+        # 2) Mantém apenas analíticas e corrige hierarquia
+        processed: List[Dict[str, Any]] = []
+        for rec in records:
+            cod = str(rec.get("CONTA_CONTABIL_COD", "")).strip()
+            if not cod or _is_synthetic(cod):
+                continue
+
+            # Recriar hierarquia CONTA_N1..CONTA_N5 a partir do código
+            if code_pattern.match(cod) and "." in cod:
+                parts = cod.split(".")
+                for level in range(1, 6):
+                    if level <= len(parts):
+                        prefix = ".".join(parts[:level])
+                        rec[f"CONTA_N{level}_COD"] = prefix
+                        # Só preenche DESC se conhece (veio como linha no doc)
+                        if prefix in code_to_desc:
+                            rec[f"CONTA_N{level}_DESC"] = code_to_desc[prefix]
+                        # Caso contrário, mantém o que veio do Claude (se válido)
+                        # ou deixa vazio
+                    else:
+                        rec[f"CONTA_N{level}_COD"] = ""
+                        rec[f"CONTA_N{level}_DESC"] = rec.get(f"CONTA_N{level}_DESC", "")
+
+            # CONTA_CONTABIL_CLASS: se vazio, usa o próprio COD
+            if not str(rec.get("CONTA_CONTABIL_CLASS", "")).strip():
+                rec["CONTA_CONTABIL_CLASS"] = cod
+
+            processed.append(rec)
+
+        return processed
+
     def custom_validations(self, records: List[Dict[str, Any]]) -> List[str]:
         issues: List[str] = []
 

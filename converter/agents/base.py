@@ -326,6 +326,15 @@ class Agent(ABC):
         """Campo chave para detectar duplicatas."""
         return ""
 
+    def post_process(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Pós-processamento determinístico após extração.
+
+        Subclasses podem override para aplicar filtros e correções que não
+        dependem do Claude (ex.: filtrar contas sintéticas, corrigir hierarquia).
+        Default: identidade (retorna sem alterar).
+        """
+        return records
+
     def schema_fields(self) -> List[str]:
         """Campos que vão no schema do tool.
 
@@ -627,12 +636,25 @@ class Agent(ABC):
         return refined
 
     def run(self) -> Dict[str, Any]:
-        """Pipeline completo: extract → validate → self_review → validate."""
+        """Pipeline completo: extract → post_process → validate → self_review → validate."""
         records = self.extract()
+
+        # Pós-processamento determinístico (ex.: filtro de sintéticas no Plano de Contas)
+        records_before_post = len(records)
+        records = self.post_process(records)
+        if len(records) != records_before_post:
+            self.log.append({
+                "step": "post_process",
+                "records_before": records_before_post,
+                "records_after": len(records),
+            })
+
         issues = self.validate(records)
 
         if issues:
             records = self.self_review(records, issues)
+            # Pós-processa de novo caso self_review tenha reintroduzido sintéticas
+            records = self.post_process(records)
             issues = self.validate(records)  # re-valida após refino
 
         # Garantir que todos os campos do schema existam em cada registro
