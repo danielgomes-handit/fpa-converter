@@ -154,40 +154,54 @@ class PlanoDeContasAgent(Agent):
     def system_prompt(self) -> str:
         return (
             "Você é um especialista em contabilidade brasileira e estruturação de "
-            "planos de contas. Sua tarefa é extrair todas as contas contábeis com "
-            "sua natureza (D/C), hierarquia DRE e níveis estruturais.\n\n"
-            "Regras de ouro:\n"
-            "1. CONTA_CONTABIL_COD é obrigatório — código reduzido da conta (ex.: 3010, "
-            "1.1.1.01).\n"
-            "2. CONTA_CONTABIL_CLASS é o código de classificação (se diferente do COD). "
-            "Se no documento só há um código, use o mesmo valor em ambos.\n"
+            "planos de contas. Sua tarefa é extrair as contas ANALÍTICAS (folha da "
+            "hierarquia, Tipo='A', que recebem lançamento) do documento.\n\n"
+            "REGRA CRÍTICA — só extraia contas ANALÍTICAS:\n"
+            "- Ignore contas SINTÉTICAS (Tipo='S', totalizadoras, agrupadoras como "
+            "'ATIVO', 'ATIVO CIRCULANTE', 'CAIXA E EQUIVALENTES', 'BANCOS', etc.).\n"
+            "- Contas sintéticas NÃO viram linhas do xlsx — elas aparecem APENAS nos "
+            "campos CONTA_N1..CONTA_N5 das contas analíticas (como hierarquia pai).\n"
+            "- Se a conta não tem subdivisão (é folha da árvore), ela é analítica e "
+            "deve ser extraída.\n\n"
+            "Outras regras:\n"
+            "1. CONTA_CONTABIL_COD é obrigatório — código da conta analítica (ex.: "
+            "1.1.1.01, 3010).\n"
+            "2. CONTA_CONTABIL_CLASS: se o documento não tiver um código de "
+            "classificação separado, use o mesmo valor de CONTA_CONTABIL_COD.\n"
             "3. NATUREZA_LANCAMENTO_COD: sempre 'D' (Devedora) ou 'C' (Credora). "
-            "Deduza pela posição no plano: Ativo, Despesa, Custo → D; Passivo, "
-            "Patrimônio Líquido, Receita → C. Contas redutoras (ex.: depreciação "
-            "acumulada, PECLD) têm natureza INVERSA ao grupo.\n"
-            "4. Contas sintéticas (totalizadoras, Tipo='S') e analíticas "
-            "(Tipo='A', recebem lançamento) devem ambas ser extraídas.\n"
-            "5. CONTA_N1..CONTA_N5: derive da hierarquia do código (quebra pelo '.') ou "
-            "das colunas 'Grupo/Subgrupo/Sintética/Analítica' do documento.\n"
-            "6. DRE_N1_COD/DESC: quando o documento indica a linha da DRE, preencha. "
+            "Ativo/Despesa/Custo → D; Passivo/PL/Receita → C. Contas redutoras "
+            "((-) depreciação acumulada, (-) PECLD, etc.) têm natureza INVERSA ao grupo.\n"
+            "4. HIERARQUIA — muito importante entender a diferença:\n"
+            "   - CONTA_N{i}_COD: o CÓDIGO NUMÉRICO do nível pai (ex.: '1', '1.1', "
+            "'1.1.1', obtido quebrando o código da conta analítica pelo '.').\n"
+            "   - CONTA_N{i}_DESC: a DESCRIÇÃO/NOME do nível pai (ex.: 'ATIVO', "
+            "'ATIVO CIRCULANTE', 'CAIXA E EQUIVALENTES').\n"
+            "   NUNCA coloque a descrição no campo _COD. NUNCA coloque o código no "
+            "campo _DESC. Exemplo para a conta analítica '1.1.1.01 — Caixa Geral Matriz':\n"
+            "     CONTA_N1_COD='1', CONTA_N1_DESC='ATIVO'\n"
+            "     CONTA_N2_COD='1.1', CONTA_N2_DESC='ATIVO CIRCULANTE'\n"
+            "     CONTA_N3_COD='1.1.1', CONTA_N3_DESC='CAIXA E EQUIVALENTES DE CAIXA'\n"
+            "5. DRE_N1_COD/DESC: preencha quando o documento indicar a linha da DRE. "
             "Caso contrário, deixe vazio.\n"
-            "7. PACOTE: só preencha se o documento explicitar um agrupador (pacote Handit). "
-            "Caso contrário, deixe vazio.\n"
-            "8. Deduplicar por CONTA_CONTABIL_COD. Se a mesma conta se repete entre "
-            "empresas/SPEs, consolide e registre em notes."
+            "6. PACOTE: só se o documento explicitar um agrupador Handit. Senão, vazio.\n"
+            "7. Deduplicar por CONTA_CONTABIL_COD."
         )
 
     def extract_instructions(self) -> str:
         return (
             "Procure no documento:\n"
-            "- Colunas como 'Conta', 'Código', 'Descrição', 'Natureza', 'DRE', 'Tipo'\n"
+            "- Colunas/indicações como 'Tipo' (S=Sintética, A=Analítica). Use para "
+            "filtrar: só extraia as linhas com Tipo='A'.\n"
             "- Estrutura hierárquica: Grupo (1 dígito) > Subgrupo (2 dígitos) > "
-            "Sintética (3-4 dígitos) > Analítica (5+ dígitos)\n"
-            "- Códigos pontuados (ex.: 1.1.1.01) indicam profundidade hierárquica\n"
-            "- PDFs podem ter tabelas com código/descrição/natureza em colunas separadas\n\n"
-            "Se o documento tem centenas de contas, extraia TODAS. Não limite "
-            "arbitrariamente. Se houver limite de output, priorize contas analíticas "
-            "(Tipo='A') sobre sintéticas, e registre em notes que algumas foram omitidas."
+            "Sintética (3+ dígitos) > Analítica (4+ dígitos, normalmente com código "
+            "mais longo que a sintética pai).\n"
+            "- Códigos pontuados (ex.: 1.1.1.01) indicam profundidade hierárquica. "
+            "A última parte do código costuma ser a analítica.\n"
+            "- Para cada conta analítica, preencha os CONTA_N*_COD com os prefixos "
+            "do código (quebras por ponto) e CONTA_N*_DESC com os nomes das contas "
+            "sintéticas pais (buscando no próprio documento).\n\n"
+            "Se o documento tiver centenas de contas analíticas, extraia TODAS. Se "
+            "exceder o limite de output, registre em `notes` quantas ficaram de fora."
         )
 
     def custom_validations(self, records: List[Dict[str, Any]]) -> List[str]:
@@ -223,20 +237,37 @@ class PlanoDeContasAgent(Agent):
                     f"estar inconsistente com a descrição (esperado '{expected}')."
                 )
 
+        # Detecta se o Claude trocou _COD por _DESC (colocou descrição no campo de código).
+        # Em vez de reportar linha por linha, consolida num único alerta.
         code_pattern = re.compile(r"^[\d.]+$")
+        swapped_count = 0
+        first_sample = None
         for i, rec in enumerate(records, 1):
             cod = str(rec.get("CONTA_CONTABIL_COD", "")).strip()
-            if code_pattern.match(cod) and "." in cod:
-                parts = cod.split(".")
-                for level_idx in range(1, min(len(parts), 5) + 1):
-                    expected = ".".join(parts[:level_idx])
-                    n_cod = str(rec.get(f"CONTA_N{level_idx}_COD", "")).strip()
-                    if n_cod and n_cod != expected:
-                        issues.append(
-                            f"Registro #{i} ({cod}): CONTA_N{level_idx}_COD='{n_cod}' "
-                            f"não bate com a quebra esperada '{expected}'."
+            if not (code_pattern.match(cod) and "." in cod):
+                continue
+            parts = cod.split(".")
+            for level_idx in range(1, min(len(parts), 5) + 1):
+                expected = ".".join(parts[:level_idx])
+                n_cod = str(rec.get(f"CONTA_N{level_idx}_COD", "")).strip()
+                # Ignora vazio (já tratado pela diretriz de omitir campos vazios)
+                if not n_cod:
+                    continue
+                # Se o campo _COD tem letras, provavelmente é descrição (swap)
+                if not code_pattern.match(n_cod):
+                    swapped_count += 1
+                    if first_sample is None:
+                        first_sample = (
+                            f"ex.: conta {cod} → CONTA_N{level_idx}_COD='{n_cod}' "
+                            f"(esperado '{expected}')"
                         )
-                        break
+                    break
+
+        if swapped_count > 0:
+            issues.append(
+                f"{swapped_count} registros têm descrição em CONTA_N*_COD em vez do "
+                f"código numérico. {first_sample}. Verifique a hierarquia no xlsx final."
+            )
 
         return issues
 

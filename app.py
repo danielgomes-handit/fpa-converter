@@ -47,9 +47,10 @@ if CLAUDE_MAX_TOKENS:
     os.environ["CLAUDE_MAX_TOKENS"] = CLAUDE_MAX_TOKENS
 
 
+_icon_path = Path("assets/handit-icon.png")
 st.set_page_config(
     page_title="FP&A Base Converter · Handit",
-    page_icon="📊",
+    page_icon=str(_icon_path) if _icon_path.exists() else "📊",
     layout="centered",
     initial_sidebar_state="collapsed",
 )
@@ -207,9 +208,10 @@ st.markdown("""
 
 
 def _render_brand():
+    """Mostra o logo oficial da Handit no topo. Fallback em texto estilizado."""
     logo_path = Path("assets/handit-logo.png")
     if logo_path.exists():
-        st.image(str(logo_path), width=140)
+        st.image(str(logo_path), width=180)
     else:
         st.markdown(
             '<span class="handit-brand-text">Hand<span class="handit-brand-accent">i</span>t</span>',
