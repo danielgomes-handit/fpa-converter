@@ -154,72 +154,87 @@ class PlanoDeContasAgent(Agent):
     def system_prompt(self) -> str:
         return (
             "Você é um especialista em contabilidade brasileira e estruturação de "
-            "planos de contas. Sua tarefa é extrair as contas ANALÍTICAS (folha da "
-            "hierarquia, Tipo='A', que recebem lançamento) do documento.\n\n"
-            "REGRA CRÍTICA — só extraia contas ANALÍTICAS:\n"
-            "- Ignore contas SINTÉTICAS (Tipo='S', totalizadoras, agrupadoras como "
-            "'ATIVO', 'ATIVO CIRCULANTE', 'CAIXA E EQUIVALENTES', 'BANCOS', etc.).\n"
-            "- Contas sintéticas NÃO viram linhas do xlsx — elas aparecem APENAS nos "
-            "campos CONTA_N1..CONTA_N5 das contas analíticas (como hierarquia pai).\n"
-            "- Se a conta não tem subdivisão (é folha da árvore), ela é analítica e "
-            "deve ser extraída.\n\n"
-            "Outras regras:\n"
-            "1. CONTA_CONTABIL_COD é obrigatório — código da conta analítica (ex.: "
-            "1.1.1.01, 3010).\n"
-            "2. CONTA_CONTABIL_CLASS: se o documento não tiver um código de "
+            "planos de contas. Sua tarefa é extrair o plano de contas completo "
+            "(tanto contas SINTÉTICAS quanto ANALÍTICAS) do documento.\n\n"
+            "IMPORTANTE — extraia TODAS as contas (sintéticas + analíticas):\n"
+            "- Contas SINTÉTICAS (Tipo='S', totalizadoras, agrupadoras como 'ATIVO', "
+            "'ATIVO CIRCULANTE', 'BANCOS', etc.) → EXTRAIA como linhas normais.\n"
+            "- Contas ANALÍTICAS (Tipo='A', folha da hierarquia, que recebem lançamento) "
+            "→ EXTRAIA como linhas normais.\n"
+            "- Um pós-processamento automático vai remover as sintéticas do arquivo "
+            "final e usar suas descrições para preencher a hierarquia das analíticas. "
+            "Por isso precisamos de TODAS no retorno.\n\n"
+            "Regras por campo:\n"
+            "1. CONTA_CONTABIL_COD é obrigatório — código numérico/pontuado da conta "
+            "(ex.: '1', '1.1', '1.1.1', '1.1.1.01', '3010').\n"
+            "2. CONTA_CONTABIL_DESC é obrigatório — NOME da conta (ex.: 'ATIVO', "
+            "'ATIVO CIRCULANTE', 'Caixa Geral - Matriz'). NUNCA coloque o código aqui.\n"
+            "3. CONTA_CONTABIL_CLASS: se o documento não tiver um código de "
             "classificação separado, use o mesmo valor de CONTA_CONTABIL_COD.\n"
-            "3. NATUREZA_LANCAMENTO_COD: sempre 'D' (Devedora) ou 'C' (Credora). "
+            "4. NATUREZA_LANCAMENTO_COD: 'D' (Devedora) ou 'C' (Credora). "
             "Ativo/Despesa/Custo → D; Passivo/PL/Receita → C. Contas redutoras "
-            "((-) depreciação acumulada, (-) PECLD, etc.) têm natureza INVERSA ao grupo.\n"
-            "4. HIERARQUIA — muito importante entender a diferença:\n"
-            "   - CONTA_N{i}_COD: o CÓDIGO NUMÉRICO do nível pai (ex.: '1', '1.1', "
-            "'1.1.1', obtido quebrando o código da conta analítica pelo '.').\n"
-            "   - CONTA_N{i}_DESC: a DESCRIÇÃO/NOME do nível pai (ex.: 'ATIVO', "
-            "'ATIVO CIRCULANTE', 'CAIXA E EQUIVALENTES').\n"
-            "   NUNCA coloque a descrição no campo _COD. NUNCA coloque o código no "
-            "campo _DESC. Exemplo para a conta analítica '1.1.1.01 — Caixa Geral Matriz':\n"
-            "     CONTA_N1_COD='1', CONTA_N1_DESC='ATIVO'\n"
-            "     CONTA_N2_COD='1.1', CONTA_N2_DESC='ATIVO CIRCULANTE'\n"
-            "     CONTA_N3_COD='1.1.1', CONTA_N3_DESC='CAIXA E EQUIVALENTES DE CAIXA'\n"
-            "5. DRE_N1_COD/DESC: preencha quando o documento indicar a linha da DRE. "
+            "((-) depreciação acumulada, (-) PECLD, etc.) têm natureza INVERSA ao grupo. "
+            "Para sintéticas, pode deixar vazio se não souber.\n"
+            "5. CONTA_N1..N5 (COD e DESC): você NÃO precisa preencher. O "
+            "pós-processamento reconstrói a hierarquia automaticamente a partir do "
+            "código (quebra por ponto) e das descrições das sintéticas. Deixe vazios.\n"
+            "6. DRE_N1_COD/DESC: preencha quando o documento indicar a linha da DRE. "
             "Caso contrário, deixe vazio.\n"
-            "6. PACOTE: só se o documento explicitar um agrupador Handit. Senão, vazio.\n"
-            "7. Deduplicar por CONTA_CONTABIL_COD."
+            "7. PACOTE: só se o documento explicitar um agrupador Handit. Senão, vazio.\n"
+            "8. Deduplicar por CONTA_CONTABIL_COD.\n\n"
+            "EXEMPLO do que extrair (para um plano com 'ATIVO > ATIVO CIRCULANTE > "
+            "CAIXA > Caixa Geral Matriz'):\n"
+            "  Linha 1: COD='1',        DESC='ATIVO',                 NATUREZA='D'\n"
+            "  Linha 2: COD='1.1',      DESC='ATIVO CIRCULANTE',      NATUREZA='D'\n"
+            "  Linha 3: COD='1.1.1',    DESC='CAIXA E EQUIVALENTES',  NATUREZA='D'\n"
+            "  Linha 4: COD='1.1.1.01', DESC='Caixa Geral - Matriz',  NATUREZA='D'\n"
+            "O pós-processamento filtra automaticamente as linhas 1-3 (sintéticas) e "
+            "popula CONTA_N1_DESC='ATIVO', CONTA_N2_DESC='ATIVO CIRCULANTE', etc. na linha 4."
         )
 
     def extract_instructions(self) -> str:
         return (
-            "Procure no documento:\n"
-            "- Colunas/indicações como 'Tipo' (S=Sintética, A=Analítica). Use para "
-            "filtrar: só extraia as linhas com Tipo='A'.\n"
+            "Procure no documento TODAS as contas do plano (sintéticas + analíticas):\n"
+            "- Colunas/indicações como 'Tipo' (S=Sintética, A=Analítica), 'Classificação', "
+            "'Código' e 'Descrição/Nome'. Traga TODAS as linhas, não filtre por Tipo.\n"
             "- Estrutura hierárquica: Grupo (1 dígito) > Subgrupo (2 dígitos) > "
-            "Sintética (3+ dígitos) > Analítica (4+ dígitos, normalmente com código "
-            "mais longo que a sintética pai).\n"
-            "- Códigos pontuados (ex.: 1.1.1.01) indicam profundidade hierárquica. "
-            "A última parte do código costuma ser a analítica.\n"
-            "- Para cada conta analítica, preencha os CONTA_N*_COD com os prefixos "
-            "do código (quebras por ponto) e CONTA_N*_DESC com os nomes das contas "
-            "sintéticas pais (buscando no próprio documento).\n\n"
-            "Se o documento tiver centenas de contas analíticas, extraia TODAS. Se "
-            "exceder o limite de output, registre em `notes` quantas ficaram de fora."
+            "Sintética (3+ dígitos) > Analítica (4+ dígitos). Todos os níveis devem "
+            "aparecer como linhas separadas.\n"
+            "- Códigos pontuados (ex.: 1.1.1.01) indicam profundidade. Mantenha o "
+            "formato original do código.\n"
+            "- Para cada conta, só preencha CONTA_CONTABIL_COD, CONTA_CONTABIL_DESC e "
+            "(quando possível) NATUREZA_LANCAMENTO_COD + DRE_N1_COD/DESC. Os campos "
+            "CONTA_N1..N5 ficam VAZIOS — o pós-processamento reconstrói.\n\n"
+            "Se o documento tiver centenas de contas, extraia TODAS. Se exceder o "
+            "limite de output, registre em `notes` quantas ficaram de fora."
         )
 
     def post_process(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Pós-processamento determinístico após extração do Claude.
 
-        1. Remove contas sintéticas (códigos que são prefixo de algum outro código).
-        2. Corrige hierarquia CONTA_N*_COD/DESC baseado no próprio código.
+        Estratégia: o Claude agora extrai TODAS as contas (sintéticas + analíticas).
+        Aqui nós:
+        1. Construímos um mapa código → descrição usando TODAS as linhas.
+        2. Removemos as sintéticas (códigos que são prefixo de algum outro código).
+        3. Reconstruímos CONTA_N1..N5 (COD e DESC) a partir do código da conta
+           analítica e das descrições coletadas.
         """
         code_pattern = re.compile(r"^[\d.]+$")
 
-        # 1) Filtrar sintéticas: uma conta é sintética se EXISTE outra conta cujo
-        #    código começa com o código dela + ".". Ex.: "1.1.1" é sintética se
-        #    existe "1.1.1.01" ou "1.1.1.02" nos registros.
+        # Mapa código → descrição usando TODAS as linhas (sintéticas + analíticas)
+        # — precisamos das descrições das sintéticas para preencher CONTA_N*_DESC.
+        code_to_desc: Dict[str, str] = {}
         all_codes = set()
         for rec in records:
             cod = str(rec.get("CONTA_CONTABIL_COD", "")).strip()
-            if cod:
-                all_codes.add(cod)
+            desc = str(rec.get("CONTA_CONTABIL_DESC", "")).strip()
+            if not cod:
+                continue
+            all_codes.add(cod)
+            # Só aceita descrição se for diferente do próprio código (evita ruído
+            # quando o Claude confunde os dois campos).
+            if desc and desc != cod:
+                code_to_desc[cod] = desc
 
         def _is_synthetic(code: str) -> bool:
             if not code:
@@ -227,36 +242,38 @@ class PlanoDeContasAgent(Agent):
             prefix = code + "."
             return any(other.startswith(prefix) for other in all_codes if other != code)
 
-        # Mapa código → descrição (para preencher CONTA_N*_DESC)
-        code_to_desc: Dict[str, str] = {}
-        for rec in records:
-            cod = str(rec.get("CONTA_CONTABIL_COD", "")).strip()
-            desc = str(rec.get("CONTA_CONTABIL_DESC", "")).strip()
-            if cod and desc:
-                code_to_desc[cod] = desc
-
-        # 2) Mantém apenas analíticas e corrige hierarquia
+        # Mantém apenas analíticas e reconstrói hierarquia
         processed: List[Dict[str, Any]] = []
         for rec in records:
             cod = str(rec.get("CONTA_CONTABIL_COD", "")).strip()
             if not cod or _is_synthetic(cod):
                 continue
 
-            # Recriar hierarquia CONTA_N1..CONTA_N5 a partir do código
+            # Zera todos os CONTA_N*_COD/DESC antes de reconstruir (descarta o que
+            # o Claude possa ter enviado por engano)
+            for level in range(1, 6):
+                rec[f"CONTA_N{level}_COD"] = ""
+                rec[f"CONTA_N{level}_DESC"] = ""
+
+            # Reconstrói hierarquia a partir do código
             if code_pattern.match(cod) and "." in cod:
                 parts = cod.split(".")
                 for level in range(1, 6):
                     if level <= len(parts):
                         prefix = ".".join(parts[:level])
                         rec[f"CONTA_N{level}_COD"] = prefix
-                        # Só preenche DESC se conhece (veio como linha no doc)
+                        # Só preenche DESC se temos a descrição mapeada. Senão
+                        # deixa vazio (melhor que duplicar o código).
                         if prefix in code_to_desc:
                             rec[f"CONTA_N{level}_DESC"] = code_to_desc[prefix]
-                        # Caso contrário, mantém o que veio do Claude (se válido)
-                        # ou deixa vazio
-                    else:
-                        rec[f"CONTA_N{level}_COD"] = ""
-                        rec[f"CONTA_N{level}_DESC"] = rec.get(f"CONTA_N{level}_DESC", "")
+
+            # Sanidade final: se CONTA_N*_DESC ficou igual ao COD (edge case),
+            # limpa.
+            for level in range(1, 6):
+                c = str(rec.get(f"CONTA_N{level}_COD", "")).strip()
+                d = str(rec.get(f"CONTA_N{level}_DESC", "")).strip()
+                if c and d == c:
+                    rec[f"CONTA_N{level}_DESC"] = ""
 
             # CONTA_CONTABIL_CLASS: se vazio, usa o próprio COD
             if not str(rec.get("CONTA_CONTABIL_CLASS", "")).strip():
