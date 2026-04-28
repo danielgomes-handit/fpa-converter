@@ -138,9 +138,33 @@ def _pdf_chunks(path: Path, pages_per_chunk: int = DEFAULT_PDF_PAGES_PER_CHUNK
     return chunks
 
 
+def _df_to_text_block(path: Path, sheet_name: str, df, range_label: str = ""
+                      ) -> Dict[str, Any]:
+    """Serializa um DataFrame inteiro como bloco de texto markdown/CSV para o LLM."""
+    cols = list(df.columns)
+    try:
+        md_table = df.to_markdown(index=False)
+    except (ImportError, ModuleNotFoundError):
+        md_table = df.to_csv(index=False)
+    except Exception:
+        md_table = df.to_string(index=False)
+
+    if range_label:
+        sheet_line = f"## Aba: `{sheet_name}` — {range_label}\n"
+    else:
+        sheet_line = f"## Aba: `{sheet_name}` ({len(df)} linhas)\n"
+
+    preamble = (
+        f"# Arquivo: `{path.name}`\n"
+        f"{sheet_line}"
+        f"### Colunas: {cols}\n\n"
+    )
+    return {"type": "text", "text": preamble + md_table}
+
+
 def _tabular_chunks(path: Path, rows_per_chunk: int = DEFAULT_TABULAR_ROWS_PER_CHUNK
                     ) -> List[List[Dict[str, Any]]]:
-    """Divide xlsx/csv em chunks de N linhas. Só fragmenta se planilha for muito grande."""
+    """Divide xlsx/csv em chunks. Sempre envia conteúdo COMPLETO (não amostra)."""
     import pandas as pd
     from ..analyzer import _read_csv_smart
 
@@ -166,34 +190,25 @@ def _tabular_chunks(path: Path, rows_per_chunk: int = DEFAULT_TABULAR_ROWS_PER_C
 
     total_rows_across = sum(len(df) for df in sheets_data.values())
 
-    # Se cabe num chunk único, usa o caminho normal (analyzer + profile_to_prompt)
+    # Caso 1: cabe num único chunk → manda o CONTEÚDO COMPLETO (todas as linhas).
+    # Antes usava _document_blocks que mandava só uma amostra de 5 linhas via
+    # profile_to_prompt — isso fazia o LLM extrair só 5 contas.
     if total_rows_across <= rows_per_chunk:
-        return [_document_blocks(path, FileKind.TABULAR_STRUCTURED)]
+        blocks = [
+            _df_to_text_block(path, sheet_name, df)
+            for sheet_name, df in sheets_data.items()
+        ]
+        return [blocks]
 
+    # Caso 2: muito grande → fragmenta em pedaços de rows_per_chunk linhas
     chunks: List[List[Dict[str, Any]]] = []
     for sheet_name, df in sheets_data.items():
         sheet_total = len(df)
-        cols = list(df.columns)
-
         for start in range(0, sheet_total, rows_per_chunk):
             end = min(start + rows_per_chunk, sheet_total)
             chunk_df = df.iloc[start:end]
-            try:
-                md_table = chunk_df.to_markdown(index=False)
-            except (ImportError, ModuleNotFoundError):
-                md_table = chunk_df.to_csv(index=False)
-            except Exception:
-                md_table = chunk_df.to_string(index=False)
-
-            preamble_txt = (
-                f"# Arquivo: `{path.name}`\n"
-                f"## Aba: `{sheet_name}` — linhas {start + 1} a {end} de {sheet_total}\n"
-                f"### Colunas: {cols}\n\n"
-            )
-            chunks.append([{
-                "type": "text",
-                "text": preamble_txt + md_table,
-            }])
+            range_label = f"linhas {start + 1} a {end} de {sheet_total}"
+            chunks.append([_df_to_text_block(path, sheet_name, chunk_df, range_label)])
 
     return chunks if chunks else [_document_blocks(path, FileKind.TABULAR_STRUCTURED)]
 
