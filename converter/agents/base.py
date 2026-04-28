@@ -176,6 +176,8 @@ def _tabular_chunks(path: Path, rows_per_chunk: int = 60) -> List[List[Dict[str,
             chunk_df = df.iloc[start:end]
             try:
                 md_table = chunk_df.to_markdown(index=False)
+            except (ImportError, ModuleNotFoundError):
+                md_table = chunk_df.to_csv(index=False)
             except Exception:
                 md_table = chunk_df.to_string(index=False)
 

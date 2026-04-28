@@ -178,7 +178,14 @@ def _profile_column(series: pd.Series, n_samples: int = 5) -> ColumnProfile:
 
 def _profile_sheet(df: pd.DataFrame, sheet_name: str, n_head: int = 5) -> SheetProfile:
     cols = [_profile_column(df[c]) for c in df.columns]
-    head_md = df.head(n_head).to_markdown(index=False) if len(df) else ""
+    head_md = ""
+    if len(df):
+        try:
+            head_md = df.head(n_head).to_markdown(index=False)
+        except (ImportError, ModuleNotFoundError):
+            head_md = df.head(n_head).to_csv(index=False)
+        except Exception:
+            head_md = df.head(n_head).to_string(index=False)
     return SheetProfile(
         name=sheet_name,
         row_count=int(df.shape[0]),
