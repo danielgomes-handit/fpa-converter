@@ -137,6 +137,7 @@ def _pdf_chunks(path: Path, pages_per_chunk: int = 3) -> List[List[Dict[str, Any
 def _tabular_chunks(path: Path, rows_per_chunk: int = 60) -> List[List[Dict[str, Any]]]:
     """Divide xlsx/csv em chunks de N linhas cada."""
     import pandas as pd
+    from ..analyzer import _read_csv_smart
 
     try:
         if path.suffix.lower() in {".xlsx", ".xlsm"}:
@@ -150,8 +151,7 @@ def _tabular_chunks(path: Path, rows_per_chunk: int = 60) -> List[List[Dict[str,
                 except Exception:
                     continue
         else:
-            sep = "\t" if path.suffix.lower() == ".tsv" else ","
-            df = pd.read_csv(path, sep=sep, dtype=str)
+            df = _read_csv_smart(path)
             sheets_data = {path.stem: df}
     except Exception:
         return [_document_blocks(path, FileKind.TABULAR_STRUCTURED)]

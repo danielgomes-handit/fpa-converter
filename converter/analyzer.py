@@ -4,11 +4,141 @@ O objetivo é dar ao Claude informação suficiente para propor o mapeamento
 sem precisar enviar o arquivo inteiro (o que seria caro e lento).
 """
 
+import csv as _csv
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List
 
 import pandas as pd
+
+
+# =============================================================================
+# Leitura robusta de CSV (detecta separador automaticamente)
+# =============================================================================
+
+def _read_text_with_fallback(path: Path, sample_size: int | None = None) -> str:
+    """Lê arquivo texto com fallback de encoding (utf-8 → latin-1 → cp1252)."""
+    for enc in ("utf-8", "latin-1", "cp1252"):
+        try:
+            with open(path, "r", encoding=enc, errors="strict") as f:
+                return f.read() if sample_size is None else f.read(sample_size)
+        except UnicodeDecodeError:
+            continue
+        except Exception:
+            break
+    # Último recurso: replace
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        return f.read() if sample_size is None else f.read(sample_size)
+
+
+def _detect_csv_layout(path: Path, sample_size: int = 16384) -> Dict[str, Any]:
+    """Detecta separador, encoding e linha onde começa a tabela real.
+
+    Retorna dict com:
+    - separator: ',' | ';' | '\\t' | '|'
+    - skiprows: número de linhas a ignorar antes do header
+    - encoding: encoding usado
+    """
+    sample = _read_text_with_fallback(path, sample_size)
+
+    candidates = [";", ",", "\t", "|"]
+    lines = sample.splitlines()
+
+    # Para cada separador candidato, encontra a linha onde começam várias linhas
+    # consecutivas com o mesmo número de campos (heurística de "tabela real").
+    best = {"separator": ",", "skiprows": 0, "score": -1}
+
+    for sep in candidates:
+        # Conta separadores em cada linha não-vazia
+        counts = [ln.count(sep) for ln in lines]
+
+        # Procura janela de pelo menos 3 linhas consecutivas com mesmo count > 0
+        for start in range(len(counts)):
+            c = counts[start]
+            if c == 0:
+                continue
+            # Quantas linhas consecutivas a partir daqui têm o MESMO count?
+            run = 1
+            for j in range(start + 1, min(start + 50, len(counts))):
+                if counts[j] == c:
+                    run += 1
+                else:
+                    # tolera 1 linha quebrada no meio
+                    if j + 1 < len(counts) and counts[j + 1] == c:
+                        run += 1
+                        continue
+                    break
+            # Score: alto número de campos consistentes × tamanho do run
+            score = c * run
+            if run >= 3 and score > best["score"]:
+                best = {"separator": sep, "skiprows": start, "score": score}
+
+    return {
+        "separator": best["separator"],
+        "skiprows": best["skiprows"],
+    }
+
+
+def _detect_csv_separator(path: Path, sample_size: int = 8192) -> str:
+    """Compatibilidade: retorna apenas o separador detectado."""
+    return _detect_csv_layout(path, sample_size)["separator"]
+
+
+def _read_csv_smart(path: Path, dtype=str) -> pd.DataFrame:
+    """Lê CSV detectando separador, encoding e linhas de cabeçalho-livre."""
+    suffix = path.suffix.lower()
+    if suffix == ".tsv":
+        layout = {"separator": "\t", "skiprows": 0}
+    else:
+        layout = _detect_csv_layout(path)
+
+    sep = layout["separator"]
+    skiprows = layout["skiprows"]
+
+    # Tentativa 1: engine C (rápido) com skiprows detectado
+    for enc in ("utf-8", "latin-1", "cp1252"):
+        try:
+            return pd.read_csv(
+                path, sep=sep, dtype=dtype, encoding=enc, skiprows=skiprows
+            )
+        except UnicodeDecodeError:
+            continue
+        except Exception:
+            break
+
+    # Tentativa 2: engine Python tolerando linhas malformadas
+    for enc in ("utf-8", "latin-1", "cp1252"):
+        try:
+            return pd.read_csv(
+                path,
+                sep=sep,
+                dtype=dtype,
+                encoding=enc,
+                skiprows=skiprows,
+                engine="python",
+                on_bad_lines="skip",
+            )
+        except Exception:
+            continue
+
+    # Tentativa 3: auto-detect total (sep=None, skiprows=0)
+    for enc in ("utf-8", "latin-1", "cp1252"):
+        try:
+            return pd.read_csv(
+                path,
+                sep=None,
+                dtype=dtype,
+                encoding=enc,
+                engine="python",
+                on_bad_lines="skip",
+            )
+        except Exception:
+            continue
+
+    raise ValueError(
+        f"Não foi possível ler o CSV '{path.name}'. "
+        f"Verifique o separador e a codificação do arquivo."
+    )
 
 
 @dataclass
@@ -73,8 +203,7 @@ def analyze_file(path: str | Path) -> FileProfile:
                 continue
             sheets.append(_profile_sheet(df, sheet_name))
     elif path.suffix.lower() in {".csv", ".tsv"}:
-        sep = "\t" if path.suffix.lower() == ".tsv" else ","
-        df = pd.read_csv(path, sep=sep, dtype=str)
+        df = _read_csv_smart(path)
         sheets.append(_profile_sheet(df, path.stem))
     else:
         raise ValueError(f"Formato não suportado: {path.suffix}")
@@ -112,6 +241,5 @@ def read_sheet(path: str | Path, sheet_name: str) -> pd.DataFrame:
     if path.suffix.lower() in {".xlsx", ".xlsm"}:
         return pd.read_excel(path, sheet_name=sheet_name, dtype=str)
     if path.suffix.lower() in {".csv", ".tsv"}:
-        sep = "\t" if path.suffix.lower() == ".tsv" else ","
-        return pd.read_csv(path, sep=sep, dtype=str)
+        return _read_csv_smart(path)
     raise ValueError(f"Formato não suportado: {path.suffix}")
