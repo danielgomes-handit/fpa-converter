@@ -234,15 +234,21 @@ class PlanoDeContasAgent(Agent):
 
         Estratégia: o Claude agora extrai TODAS as contas (sintéticas + analíticas).
         Aqui nós:
-        1. Construímos um mapa código → descrição usando TODAS as linhas.
-        2. Removemos as sintéticas (códigos que são prefixo de algum outro código).
-        3. Reconstruímos CONTA_N1..N5 (COD e DESC) a partir do código da conta
+        1. Detectamos qual separador hierárquico o cliente usa ('.', '-' ou '/').
+        2. Construímos um mapa código → descrição usando TODAS as linhas.
+        3. Removemos as sintéticas (códigos que são prefixo de algum outro código).
+        4. Reconstruímos CONTA_N1..N5 (COD e DESC) a partir do código da conta
            analítica e das descrições coletadas.
         """
-        code_pattern = re.compile(r"^[\d.]+$")
+        # 1) Detecta o separador hierárquico majoritário nos códigos
+        sep = self._detect_hierarchy_separator(records)
 
-        # Mapa código → descrição usando TODAS as linhas (sintéticas + analíticas)
-        # — precisamos das descrições das sintéticas para preencher CONTA_N*_DESC.
+        # Regex tolerante: aceita dígitos, letras, pontos e hífens (nessa ordem,
+        # cobre a maioria dos planos brasileiros).
+        # Exige pelo menos um caractere alfanumérico para evitar matches vazios.
+        code_pattern = re.compile(r"^[\w.\-/]+$")
+
+        # 2) Mapa código → descrição usando TODAS as linhas (sintéticas + analíticas)
         code_to_desc: Dict[str, str] = {}
         all_codes = set()
         for rec in records:
@@ -251,44 +257,40 @@ class PlanoDeContasAgent(Agent):
             if not cod:
                 continue
             all_codes.add(cod)
-            # Só aceita descrição se for diferente do próprio código (evita ruído
-            # quando o Claude confunde os dois campos).
+            # Só aceita descrição se for diferente do próprio código (evita ruído).
             if desc and desc != cod:
                 code_to_desc[cod] = desc
 
         def _is_synthetic(code: str) -> bool:
-            if not code:
+            """Conta é sintética se algum outro código começa com 'code + sep'."""
+            if not code or not sep:
                 return False
-            prefix = code + "."
+            prefix = code + sep
             return any(other.startswith(prefix) for other in all_codes if other != code)
 
-        # Mantém apenas analíticas e reconstrói hierarquia
+        # 3) Mantém apenas analíticas e reconstrói hierarquia
         processed: List[Dict[str, Any]] = []
         for rec in records:
             cod = str(rec.get("CONTA_CONTABIL_COD", "")).strip()
             if not cod or _is_synthetic(cod):
                 continue
 
-            # Zera todos os CONTA_N*_COD/DESC antes de reconstruir (descarta o que
-            # o Claude possa ter enviado por engano)
+            # Zera CONTA_N*_COD/DESC antes de reconstruir
             for level in range(1, 6):
                 rec[f"CONTA_N{level}_COD"] = ""
                 rec[f"CONTA_N{level}_DESC"] = ""
 
-            # Reconstrói hierarquia a partir do código
-            if code_pattern.match(cod) and "." in cod:
-                parts = cod.split(".")
+            # Reconstrói hierarquia a partir do código (usando o separador detectado)
+            if sep and code_pattern.match(cod) and sep in cod:
+                parts = cod.split(sep)
                 for level in range(1, 6):
                     if level <= len(parts):
-                        prefix = ".".join(parts[:level])
+                        prefix = sep.join(parts[:level])
                         rec[f"CONTA_N{level}_COD"] = prefix
-                        # Só preenche DESC se temos a descrição mapeada. Senão
-                        # deixa vazio (melhor que duplicar o código).
                         if prefix in code_to_desc:
                             rec[f"CONTA_N{level}_DESC"] = code_to_desc[prefix]
 
-            # Sanidade final: se CONTA_N*_DESC ficou igual ao COD (edge case),
-            # limpa.
+            # Sanidade: se CONTA_N*_DESC ficou igual ao COD, limpa
             for level in range(1, 6):
                 c = str(rec.get(f"CONTA_N{level}_COD", "")).strip()
                 d = str(rec.get(f"CONTA_N{level}_DESC", "")).strip()
@@ -302,6 +304,37 @@ class PlanoDeContasAgent(Agent):
             processed.append(rec)
 
         return processed
+
+    @staticmethod
+    def _detect_hierarchy_separator(records: List[Dict[str, Any]]) -> str:
+        """Detecta o separador hierárquico majoritário usado nos códigos.
+
+        Testa '.', '-', '/' e retorna o que aparece com mais consistência.
+        Retorna '' se nenhum candidato for usado de forma significativa.
+        """
+        candidates = [".", "-", "/"]
+        scores: Dict[str, int] = {c: 0 for c in candidates}
+
+        codes = [
+            str(r.get("CONTA_CONTABIL_COD", "")).strip()
+            for r in records
+            if str(r.get("CONTA_CONTABIL_COD", "")).strip()
+        ]
+        if not codes:
+            return "."
+
+        for cod in codes:
+            for sep in candidates:
+                if sep in cod:
+                    scores[sep] += 1
+
+        # Pega o separador com mais ocorrências (desempate: ponto > hífen > barra)
+        best_sep = max(candidates, key=lambda s: (scores[s], -candidates.index(s)))
+        # Só retorna se foi usado em pelo menos 30% dos códigos (heurística contra
+        # códigos planos como "3010" sem hierarquia)
+        if scores[best_sep] >= max(1, len(codes) * 0.3):
+            return best_sep
+        return ""
 
     def custom_validations(self, records: List[Dict[str, Any]]) -> List[str]:
         issues: List[str] = []
@@ -337,23 +370,23 @@ class PlanoDeContasAgent(Agent):
                 )
 
         # Detecta se o Claude trocou _COD por _DESC (colocou descrição no campo de código).
-        # Em vez de reportar linha por linha, consolida num único alerta.
-        code_pattern = re.compile(r"^[\d.]+$")
+        # Usa o separador detectado nos próprios dados.
+        sep = self._detect_hierarchy_separator(records)
+        code_pattern = re.compile(r"^[\w.\-/]+$")
         swapped_count = 0
         first_sample = None
         for i, rec in enumerate(records, 1):
             cod = str(rec.get("CONTA_CONTABIL_COD", "")).strip()
-            if not (code_pattern.match(cod) and "." in cod):
+            if not (sep and code_pattern.match(cod) and sep in cod):
                 continue
-            parts = cod.split(".")
+            parts = cod.split(sep)
             for level_idx in range(1, min(len(parts), 5) + 1):
-                expected = ".".join(parts[:level_idx])
+                expected = sep.join(parts[:level_idx])
                 n_cod = str(rec.get(f"CONTA_N{level_idx}_COD", "")).strip()
-                # Ignora vazio (já tratado pela diretriz de omitir campos vazios)
                 if not n_cod:
                     continue
-                # Se o campo _COD tem letras, provavelmente é descrição (swap)
-                if not code_pattern.match(n_cod):
+                # Se o campo _COD tem só letras (sem dígitos), é descrição (swap)
+                if not any(ch.isdigit() for ch in n_cod):
                     swapped_count += 1
                     if first_sample is None:
                         first_sample = (
