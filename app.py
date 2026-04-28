@@ -33,16 +33,22 @@ def _get_secret(key: str, default: str = "") -> str:
         return os.environ.get(key, default)
 
 
-ANTHROPIC_API_KEY = _get_secret("ANTHROPIC_API_KEY")
-CLAUDE_MODEL = _get_secret("CLAUDE_MODEL", "claude-sonnet-4-6")
-CLAUDE_MAX_TOKENS = _get_secret("CLAUDE_MAX_TOKENS", "16384")
+OPENROUTER_API_KEY = _get_secret("OPENROUTER_API_KEY")
+ANTHROPIC_API_KEY = _get_secret("ANTHROPIC_API_KEY")  # fallback / legado
+LLM_API_KEY = OPENROUTER_API_KEY or ANTHROPIC_API_KEY
+
+CLAUDE_MODEL = _get_secret("CLAUDE_MODEL") or _get_secret("OPENROUTER_MODEL", "anthropic/claude-opus-4.7")
+CLAUDE_MAX_TOKENS = _get_secret("CLAUDE_MAX_TOKENS", "32000")
 APP_PASSWORD = _get_secret("APP_PASSWORD", "")
 MAX_UPLOAD_MB = int(_get_secret("MAX_UPLOAD_MB", "30"))
 
+if OPENROUTER_API_KEY:
+    os.environ["OPENROUTER_API_KEY"] = OPENROUTER_API_KEY
 if ANTHROPIC_API_KEY:
     os.environ["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
 if CLAUDE_MODEL:
     os.environ["CLAUDE_MODEL"] = CLAUDE_MODEL
+    os.environ["OPENROUTER_MODEL"] = CLAUDE_MODEL
 if CLAUDE_MAX_TOKENS:
     os.environ["CLAUDE_MAX_TOKENS"] = CLAUDE_MAX_TOKENS
 
@@ -240,8 +246,11 @@ def _check_password() -> bool:
 if not _check_password():
     st.stop()
 
-if not ANTHROPIC_API_KEY:
-    st.error("Configuração do servidor ausente. Contate o administrador.")
+if not LLM_API_KEY:
+    st.error(
+        "Configuração do servidor ausente. Adicione `OPENROUTER_API_KEY` em "
+        "`Settings → Secrets` no Streamlit Cloud."
+    )
     st.stop()
 
 

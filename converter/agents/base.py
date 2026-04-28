@@ -1,10 +1,14 @@
 """Classe base para agentes especializados + Triager.
 
 Pattern de cada agente:
-    extract → validate → self_review (se houve issues) → validate novamente
+    extract → post_process → validate → self_review (se houve issues) → validate
 
-O Triager identifica quais estruturas FP&A Base estão presentes num documento
-para que o orchestrator só acione os agentes relevantes.
+Comunicação com o LLM via `converter.llm_client` (OpenAI SDK apontando para
+OpenRouter). Modelo default: anthropic/claude-opus-4.7.
+
+Tamanhos de chunk foram aumentados dramaticamente porque o limite de output
+do OpenRouter é muito maior que o Tier 1 da Anthropic. Para a grande maioria
+dos arquivos, o documento inteiro vai numa só chamada (sem chunking real).
 """
 
 from __future__ import annotations
@@ -20,21 +24,21 @@ from io import StringIO
 from pathlib import Path
 from typing import Any, Dict, List
 
-from anthropic import Anthropic
-
+from ..llm_client import call_with_tool, get_model
 from ..router import FileKind
 from ..schemas import ALL_STRUCTURES, StructureSpec, get_structure
 
 
 # =============================================================================
-# Utilitários compartilhados
+# Utilitários compartilhados — blocos de conteúdo no formato OpenAI/OpenRouter
 # =============================================================================
 
-def _encode_pdf_base64(path: Path) -> str:
-    return base64.standard_b64encode(path.read_bytes()).decode("utf-8")
+def _pdf_data_url(pdf_bytes: bytes) -> str:
+    b64 = base64.standard_b64encode(pdf_bytes).decode("utf-8")
+    return f"data:application/pdf;base64,{b64}"
 
 
-def _encode_image_base64(path: Path) -> Dict[str, str]:
+def _image_data_url(path: Path) -> str:
     ext_to_media = {
         ".png": "image/png",
         ".jpg": "image/jpeg",
@@ -42,34 +46,32 @@ def _encode_image_base64(path: Path) -> Dict[str, str]:
         ".webp": "image/webp",
         ".gif": "image/gif",
     }
+    media = ext_to_media.get(path.suffix.lower(), "image/png")
+    b64 = base64.standard_b64encode(path.read_bytes()).decode("utf-8")
+    return f"data:{media};base64,{b64}"
+
+
+def _pdf_block(filename: str, pdf_bytes: bytes) -> Dict[str, Any]:
+    """Bloco de PDF no formato OpenRouter (file) compatível com Claude."""
     return {
-        "media_type": ext_to_media.get(path.suffix.lower(), "image/png"),
-        "data": base64.standard_b64encode(path.read_bytes()).decode("utf-8"),
+        "type": "file",
+        "file": {
+            "filename": filename,
+            "file_data": _pdf_data_url(pdf_bytes),
+        },
     }
 
 
 def _document_blocks(path: Path, file_kind: FileKind) -> List[Dict[str, Any]]:
-    """Monta blocks de conteúdo para enviar ao Claude conforme o tipo de arquivo."""
+    """Monta blocos de conteúdo para enviar ao LLM conforme o tipo de arquivo."""
     blocks: List[Dict[str, Any]] = []
 
     if file_kind in {FileKind.PDF_WITH_TEXT, FileKind.PDF_SCANNED}:
-        blocks.append({
-            "type": "document",
-            "source": {
-                "type": "base64",
-                "media_type": "application/pdf",
-                "data": _encode_pdf_base64(path),
-            },
-        })
+        blocks.append(_pdf_block(path.name, path.read_bytes()))
     elif file_kind == FileKind.IMAGE:
-        img = _encode_image_base64(path)
         blocks.append({
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": img["media_type"],
-                "data": img["data"],
-            },
+            "type": "image_url",
+            "image_url": {"url": _image_data_url(path)},
         })
     elif file_kind == FileKind.TEXT_FREEFORM:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -88,15 +90,22 @@ def _document_blocks(path: Path, file_kind: FileKind) -> List[Dict[str, Any]]:
 
 
 # =============================================================================
-# Chunking: divide documento grande em pedaços menores
+# Chunking: chunks GRANDES por padrão. Só divide se o documento for enorme.
 # =============================================================================
 
-def _pdf_chunks(path: Path, pages_per_chunk: int = 3) -> List[List[Dict[str, Any]]]:
-    """Divide PDF em chunks de N páginas cada."""
+# Defaults pensados para Opus 4.7 via OpenRouter (output ~32k tokens, contexto 200k).
+# Para a maioria dos arquivos do dia a dia, NÃO há chunking — vai tudo de uma vez.
+DEFAULT_PDF_PAGES_PER_CHUNK = int(os.environ.get("CHUNK_PDF_PAGES", "30"))
+DEFAULT_TABULAR_ROWS_PER_CHUNK = int(os.environ.get("CHUNK_TABULAR_ROWS", "600"))
+DEFAULT_TEXT_CHARS_PER_CHUNK = int(os.environ.get("CHUNK_TEXT_CHARS", "100000"))
+
+
+def _pdf_chunks(path: Path, pages_per_chunk: int = DEFAULT_PDF_PAGES_PER_CHUNK
+                ) -> List[List[Dict[str, Any]]]:
+    """Divide PDF em chunks de N páginas. Só fragmenta se PDF tiver >pages_per_chunk."""
     try:
         from pypdf import PdfReader, PdfWriter
     except ImportError:
-        # Sem pypdf, retorna o PDF inteiro como único chunk
         return [_document_blocks(path, FileKind.PDF_WITH_TEXT)]
 
     reader = PdfReader(str(path))
@@ -119,23 +128,19 @@ def _pdf_chunks(path: Path, pages_per_chunk: int = 3) -> List[List[Dict[str, Any
         chunks.append([
             {
                 "type": "text",
-                "text": f"Esta é a parte {len(chunks) + 1} do documento "
-                        f"(páginas {start + 1} a {end} de {total_pages}).",
+                "text": (
+                    f"Esta é a parte {len(chunks) + 1} do documento "
+                    f"(páginas {start + 1} a {end} de {total_pages})."
+                ),
             },
-            {
-                "type": "document",
-                "source": {
-                    "type": "base64",
-                    "media_type": "application/pdf",
-                    "data": base64.standard_b64encode(pdf_bytes).decode("utf-8"),
-                },
-            },
+            _pdf_block(f"{path.stem}_p{start+1}-{end}.pdf", pdf_bytes),
         ])
     return chunks
 
 
-def _tabular_chunks(path: Path, rows_per_chunk: int = 60) -> List[List[Dict[str, Any]]]:
-    """Divide xlsx/csv em chunks de N linhas cada."""
+def _tabular_chunks(path: Path, rows_per_chunk: int = DEFAULT_TABULAR_ROWS_PER_CHUNK
+                    ) -> List[List[Dict[str, Any]]]:
+    """Divide xlsx/csv em chunks de N linhas. Só fragmenta se planilha for muito grande."""
     import pandas as pd
     from ..analyzer import _read_csv_smart
 
@@ -159,14 +164,13 @@ def _tabular_chunks(path: Path, rows_per_chunk: int = 60) -> List[List[Dict[str,
     if not sheets_data:
         return [_document_blocks(path, FileKind.TABULAR_STRUCTURED)]
 
-    # Monta chunks, iterando cada sheet e fatiando em rows_per_chunk
-    chunks: List[List[Dict[str, Any]]] = []
     total_rows_across = sum(len(df) for df in sheets_data.values())
 
+    # Se cabe num chunk único, usa o caminho normal (analyzer + profile_to_prompt)
     if total_rows_across <= rows_per_chunk:
-        # Cabe tudo em 1 chunk, manda normal
         return [_document_blocks(path, FileKind.TABULAR_STRUCTURED)]
 
+    chunks: List[List[Dict[str, Any]]] = []
     for sheet_name, df in sheets_data.items():
         sheet_total = len(df)
         cols = list(df.columns)
@@ -194,8 +198,9 @@ def _tabular_chunks(path: Path, rows_per_chunk: int = 60) -> List[List[Dict[str,
     return chunks if chunks else [_document_blocks(path, FileKind.TABULAR_STRUCTURED)]
 
 
-def _text_chunks(path: Path, chars_per_chunk: int = 8000) -> List[List[Dict[str, Any]]]:
-    """Divide texto em chunks de N chars."""
+def _text_chunks(path: Path, chars_per_chunk: int = DEFAULT_TEXT_CHARS_PER_CHUNK
+                 ) -> List[List[Dict[str, Any]]]:
+    """Divide texto em chunks de N chars. Só fragmenta se texto for muito grande."""
     text = path.read_text(encoding="utf-8", errors="replace")
     if len(text) <= chars_per_chunk:
         return [[{"type": "text", "text": f"```\n{text}\n```"}]]
@@ -206,8 +211,10 @@ def _text_chunks(path: Path, chars_per_chunk: int = 8000) -> List[List[Dict[str,
         end = min(start + chars_per_chunk, total)
         chunks.append([{
             "type": "text",
-            "text": f"Parte {len(chunks) + 1} (chars {start + 1}-{end} de {total}):\n\n"
-                    f"```\n{text[start:end]}\n```",
+            "text": (
+                f"Parte {len(chunks) + 1} (chars {start + 1}-{end} de {total}):\n\n"
+                f"```\n{text[start:end]}\n```"
+            ),
         }])
     return chunks
 
@@ -215,23 +222,22 @@ def _text_chunks(path: Path, chars_per_chunk: int = 8000) -> List[List[Dict[str,
 def _document_chunks(
     path: Path,
     file_kind: FileKind,
-    pdf_pages_per_chunk: int = 3,
-    tabular_rows_per_chunk: int = 60,
-    text_chars_per_chunk: int = 8000,
+    pdf_pages_per_chunk: int = DEFAULT_PDF_PAGES_PER_CHUNK,
+    tabular_rows_per_chunk: int = DEFAULT_TABULAR_ROWS_PER_CHUNK,
+    text_chars_per_chunk: int = DEFAULT_TEXT_CHARS_PER_CHUNK,
 ) -> List[List[Dict[str, Any]]]:
-    """Retorna lista de chunks (cada chunk é uma lista de blocks para o Claude)."""
+    """Retorna lista de chunks (cada chunk é uma lista de blocos para o LLM)."""
     if file_kind in {FileKind.PDF_WITH_TEXT, FileKind.PDF_SCANNED}:
         return _pdf_chunks(path, pdf_pages_per_chunk)
     if file_kind in {FileKind.TABULAR_STRUCTURED, FileKind.TABULAR_MESSY}:
         return _tabular_chunks(path, tabular_rows_per_chunk)
     if file_kind == FileKind.TEXT_FREEFORM:
         return _text_chunks(path, text_chars_per_chunk)
-    # IMAGE e outros: chunk único
     return [_document_blocks(path, file_kind)]
 
 
 # =============================================================================
-# Parser CSV (Claude retorna CSV para economizar tokens vs JSON)
+# Parser CSV (LLM retorna CSV em string para economizar tokens)
 # =============================================================================
 
 def _parse_csv_records(csv_text: str, structure: StructureSpec) -> List[Dict[str, str]]:
@@ -272,16 +278,9 @@ def _parse_csv_records(csv_text: str, structure: StructureSpec) -> List[Dict[str
 # =============================================================================
 
 class Agent(ABC):
-    """Agente especializado em uma estrutura do FP&A Base.
+    """Agente especializado em uma estrutura do FP&A Base."""
 
-    Cada agente executa o pipeline:
-        1. extract: extração focada na sua estrutura
-        2. validate: validações específicas (retorna lista de issues)
-        3. self_review: se há issues, pede ao Claude para refinar
-        4. validate novamente: confere se as correções funcionaram
-    """
-
-    structure_id: str = ""  # sobrescrito pela subclasse
+    structure_id: str = ""
 
     def __init__(
         self,
@@ -295,12 +294,11 @@ class Agent(ABC):
         self.source_path = Path(source_path)
         self.file_kind = file_kind
         self.client_context = client_context
-        self.api_key = api_key or os.environ["ANTHROPIC_API_KEY"]
-        self.model = model or os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
-        self.max_tokens = int(os.environ.get("CLAUDE_MAX_TOKENS", "16384"))
-        self.timeout = int(os.environ.get("CLAUDE_TIMEOUT_SECONDS", "180"))
-        # timeout=180 = 3 minutos por chamada. Se passar, lança exceção.
-        self.client = Anthropic(api_key=self.api_key, timeout=self.timeout)
+        # Compatibilidade com chamadas antigas que passam api_key explicitamente
+        if api_key:
+            os.environ.setdefault("OPENROUTER_API_KEY", api_key)
+        self.model = model or get_model()
+        self.max_tokens = int(os.environ.get("CLAUDE_MAX_TOKENS", "32000"))
         self.log: List[Dict[str, Any]] = []
         self.progress_callback = progress_callback
 
@@ -321,33 +319,18 @@ class Agent(ABC):
         """Instruções adicionais para a extração (além do system)."""
 
     def custom_validations(self, records: List[Dict[str, Any]]) -> List[str]:
-        """Validações adicionais além das básicas. Override opcional."""
         return []
 
     def key_field(self) -> str:
-        """Campo chave para detectar duplicatas."""
         return ""
 
     def post_process(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Pós-processamento determinístico após extração.
-
-        Subclasses podem override para aplicar filtros e correções que não
-        dependem do Claude (ex.: filtrar contas sintéticas, corrigir hierarquia).
-        Default: identidade (retorna sem alterar).
-        """
         return records
 
     def extra_chunk_instruction(self) -> str:
-        """Instrução extra colocada em CADA chunk. Override opcional."""
         return ""
 
     def schema_fields(self) -> List[str]:
-        """Campos que vão no schema do tool.
-
-        Por padrão, retorna TODOS os campos da estrutura (modelo completo).
-        Subclasses podem override para economizar tokens em casos específicos.
-        Campos omitidos pelo Claude são preenchidos com "" na normalização.
-        """
         return list(self.structure.all_fields)
 
     # ---------------------------------------------------------------------
@@ -359,12 +342,6 @@ class Agent(ABC):
         return get_structure(self.structure_id)
 
     def tool_schema(self) -> Dict[str, Any]:
-        """Schema CSV: Claude retorna string CSV em vez de array de objects.
-
-        Motivo: JSON com N objetos × 19 chaves repetidas consome ~10x mais tokens
-        que um CSV com header + linhas. Para escapar do rate limit Tier 1 (8k TPM
-        output), CSV é muito mais eficiente.
-        """
         s = self.structure
         fields_for_schema = self.schema_fields()
         required_fields = [f for f in s.required_fields if f in fields_for_schema]
@@ -394,53 +371,39 @@ class Agent(ABC):
             },
         }
 
-    def _call_claude(self, user_content: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Chama Claude com streaming e retorna records parseados do CSV."""
+    def _call_llm(self, user_content: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Chama o LLM (Opus via OpenRouter) e parseia a resposta CSV."""
         tool = self.tool_schema()
-        with self.client.messages.stream(
+        result = call_with_tool(
+            system=self.system_prompt(),
+            user_content=user_content,
+            tool_schema=tool,
             model=self.model,
             max_tokens=self.max_tokens,
-            system=self.system_prompt(),
-            tools=[tool],
-            tool_choice={"type": "tool", "name": tool["name"]},
-            messages=[{"role": "user", "content": user_content}],
-        ) as stream:
-            final = stream.get_final_message()
+            stream=True,
+        )
 
-        meta = {
-            "stop_reason": final.stop_reason,
-            "input_tokens": final.usage.input_tokens,
-            "output_tokens": final.usage.output_tokens,
+        tool_input = result.get("tool_input", {}) or {}
+        csv_text = str(tool_input.get("records_csv", "") or "")
+        records = _parse_csv_records(csv_text, self.structure)
+
+        return {
+            "records": records,
+            "notes": tool_input.get("notes", ""),
+            "_csv_preview": csv_text[:500],
+            "_csv_length": len(csv_text),
+            "_meta": result.get("meta", {}),
         }
 
-        for block in final.content:
-            if block.type == "tool_use" and block.name == tool["name"]:
-                input_data = dict(block.input)
-                csv_text = input_data.get("records_csv", "") or ""
-                records = _parse_csv_records(csv_text, self.structure)
-                return {
-                    "records": records,
-                    "notes": input_data.get("notes", ""),
-                    "_csv_preview": csv_text[:500],
-                    "_csv_length": len(csv_text),
-                    "_meta": meta,
-                }
-
-        return {"records": [], "notes": "", "_meta": dict(meta, stop_reason="no_tool_use")}
-
     def extract(self) -> List[Dict[str, Any]]:
-        """Extração com chunking: processa o documento em pedaços menores.
-
-        Entre chunks aguarda `CLAUDE_RATE_LIMIT_WAIT_SECONDS` (padrão 60s) para
-        respeitar o rate limit output TPM da Anthropic.
-        """
+        """Extração via chunks (na maioria dos casos, só 1 chunk = arquivo inteiro)."""
         chunks = _document_chunks(self.source_path, self.file_kind)
         total_chunks = len(chunks)
 
         all_records: List[Dict[str, Any]] = []
         seen_keys: set = set()
         kf = self.key_field()
-        rate_wait = int(os.environ.get("CLAUDE_RATE_LIMIT_WAIT_SECONDS", "60"))
+        rate_wait = int(os.environ.get("CLAUDE_RATE_LIMIT_WAIT_SECONDS", "0"))
 
         required_fields = self.structure.required_fields
 
@@ -450,33 +413,36 @@ class Agent(ABC):
                     f"Extraindo {self.structure.label} — parte {i}/{total_chunks}..."
                 )
             else:
-                self._notify(f"Extraindo {self.structure.label}... (pode levar 1-3 min)")
+                self._notify(
+                    f"Extraindo {self.structure.label}... (pode levar 1-3 min)"
+                )
 
             preamble = (
                 f"Você vai extrair APENAS registros da estrutura "
-                f"**{self.structure.label}** desta "
-                + (f"parte {i}/{total_chunks} do " if total_chunks > 1 else "")
-                + f"documento. Outras estruturas serão processadas por outros agentes.\n\n"
+                f"**{self.structure.label}** "
+                + (f"da parte {i}/{total_chunks} do documento" if total_chunks > 1
+                   else "deste documento")
+                + ". Outras estruturas serão processadas por outros agentes.\n\n"
                 + (
-                    f"**Parte {i} de {total_chunks}**: extraia apenas o que for "
-                    f"visível nesta parte. Registros que aparecerem também em "
-                    f"outras partes serão automaticamente deduplicados depois.\n\n"
+                    f"**Parte {i} de {total_chunks}**: extraia o que estiver visível "
+                    f"nesta parte. Registros duplicados serão deduplicados depois.\n\n"
                     if total_chunks > 1 else ""
                 )
                 + "**FORMATO DE RESPOSTA (CRÍTICO):**\n"
                 "Retorne os registros em CSV (Comma-Separated Values) dentro do "
-                "campo `records_csv`. NÃO use JSON/objeto. O CSV é muito mais eficiente "
-                "em tokens, permitindo extrair centenas de registros de uma vez.\n\n"
+                "campo `records_csv`. NÃO use JSON/objeto. O CSV é eficiente em "
+                "tokens, permitindo extrair centenas de registros de uma vez.\n\n"
                 f"- Primeira linha: header com os nomes das colunas separados por vírgula.\n"
                 f"- Uma linha por registro.\n"
-                f"- Deixe células VAZIAS (nada entre as vírgulas) quando o documento "
-                f"não fornecer o valor. Ex.: `1.1.1.01,,Caixa,D`\n"
+                f"- Deixe células VAZIAS quando o documento não fornecer o valor. "
+                f"Ex.: `1.1.1.01,,Caixa,D`\n"
                 f"- Use aspas duplas em valores com vírgula ou quebra de linha. "
                 f"Ex.: `1010,,\"Caixa, Agência Centro\",D`\n"
                 f"- Campos obrigatórios que DEVEM sempre ter valor: "
                 f"{', '.join(required_fields)}\n\n"
                 f"{self.extract_instructions()}\n\n"
-                + (f"{self.extra_chunk_instruction()}\n\n" if self.extra_chunk_instruction() else "")
+                + (f"{self.extra_chunk_instruction()}\n\n"
+                   if self.extra_chunk_instruction() else "")
                 + f"Contexto do cliente: {self.client_context or '(nenhum)'}\n\n"
                 + f"Use a ferramenta `submit_{self.structure_id}` com `records_csv` preenchido."
             )
@@ -484,7 +450,7 @@ class Agent(ABC):
             content = [{"type": "text", "text": preamble}] + chunk_blocks
 
             try:
-                result = self._call_claude(content)
+                result = self._call_llm(content)
             except Exception as e:
                 self.log.append({
                     "step": f"extract_chunk_{i}",
@@ -492,7 +458,6 @@ class Agent(ABC):
                     "chunk_index": i,
                     "total_chunks": total_chunks,
                 })
-                # Se ainda tem mais chunks, tenta próximo após wait
                 if i < total_chunks and rate_wait > 0:
                     self._notify(
                         f"Erro no chunk {i}. Aguardando {rate_wait}s e tentando chunk {i+1}..."
@@ -502,7 +467,6 @@ class Agent(ABC):
 
             records = result.get("records", [])
 
-            # Deduplicação por key_field
             new_records: List[Dict[str, Any]] = []
             for rec in records:
                 if kf:
@@ -526,32 +490,28 @@ class Agent(ABC):
                 "notes": result.get("notes", ""),
             })
 
-            # Rate limit: aguardar antes do próximo chunk
             if i < total_chunks and rate_wait > 0:
                 self._notify(
-                    f"Chunk {i}/{total_chunks} OK ({len(all_records)} registros até agora). "
-                    f"Aguardando {rate_wait}s para rate limit..."
+                    f"Chunk {i}/{total_chunks} OK ({len(all_records)} registros). "
+                    f"Aguardando {rate_wait}s..."
                 )
                 time.sleep(rate_wait)
 
         return all_records
 
     def validate(self, records: List[Dict[str, Any]]) -> List[str]:
-        """Validações básicas + customizadas. Retorna lista de issues."""
         issues: List[str] = []
 
         if not records:
             issues.append("Nenhum registro foi extraído.")
             return issues
 
-        # 1) Campos obrigatórios em branco
         for i, rec in enumerate(records, 1):
             for field in self.structure.required_fields:
                 val = str(rec.get(field, "")).strip()
                 if not val:
                     issues.append(f"Registro #{i}: campo obrigatório `{field}` está vazio.")
 
-        # 2) Duplicatas no campo chave
         kf = self.key_field()
         if kf:
             seen: Dict[str, int] = {}
@@ -566,9 +526,7 @@ class Agent(ABC):
                 else:
                     seen[val] = i
 
-        # 3) Validações específicas da subclasse
         issues.extend(self.custom_validations(records))
-
         return issues
 
     def self_review(
@@ -576,19 +534,11 @@ class Agent(ABC):
         records: List[Dict[str, Any]],
         issues: List[str],
     ) -> List[Dict[str, Any]]:
-        """Pede ao Claude para revisar e refinar os registros.
-
-        Estratégia para evitar estourar rate limits:
-        - Se há muitos registros (>40), não reprocessa todos: só registra issues como alertas.
-        - Não inclui o documento original na revisão (só registros + issues).
-        """
         if not issues:
             return records
 
-        # Se muitos registros, pular self_review completo para não estourar tokens.
-        # Os issues ficam registrados e aparecem no UI para decisão humana.
         MAX_RECORDS_FOR_REVIEW = int(
-            os.environ.get("CLAUDE_SELF_REVIEW_MAX_RECORDS", "40")
+            os.environ.get("CLAUDE_SELF_REVIEW_MAX_RECORDS", "200")
         )
         if len(records) > MAX_RECORDS_FOR_REVIEW:
             self.log.append({
@@ -598,29 +548,27 @@ class Agent(ABC):
             })
             return records
 
-        self._notify(
-            f"Revisando {self.structure.label} ({len(issues)} alertas)..."
-        )
+        self._notify(f"Revisando {self.structure.label} ({len(issues)} alertas)...")
         records_json = json.dumps(records, indent=2, ensure_ascii=False)
         issues_text = "\n".join(f"- {i}" for i in issues[:25])
 
         review_prompt = (
             f"Você extraiu estes registros de {self.structure.label}:\n\n"
-            f"```json\n{records_json[:12000]}\n```\n\n"
+            f"```json\n{records_json[:30000]}\n```\n\n"
             f"A validação automática detectou problemas:\n\n{issues_text}\n\n"
             f"Revise os registros e corrija o que for possível. Se algum problema "
-            f"for uma limitação real do documento original, mantenha como está e "
+            f"for limitação real do documento original, mantenha como está e "
             f"registre em `notes`. NÃO invente dados.\n\n"
-            f"**FORMATO DE RESPOSTA**: retorne em CSV via `records_csv` (igual ao "
-            f"extract). Header na 1ª linha + uma linha por registro. "
-            f"Deixe células vazias quando não houver dado.\n\n"
+            f"**FORMATO DE RESPOSTA**: retorne em CSV via `records_csv`. "
+            f"Header na 1ª linha + uma linha por registro. Células vazias quando "
+            f"não houver dado.\n\n"
             f"Retorne a versão revisada usando `submit_{self.structure_id}`."
         )
 
         content = [{"type": "text", "text": review_prompt}]
 
         try:
-            result = self._call_claude(content)
+            result = self._call_llm(content)
         except Exception as e:
             self.log.append({
                 "step": "self_review_error",
@@ -643,10 +591,8 @@ class Agent(ABC):
         return refined
 
     def run(self) -> Dict[str, Any]:
-        """Pipeline completo: extract → post_process → validate → self_review → validate."""
         records = self.extract()
 
-        # Pós-processamento determinístico (ex.: filtro de sintéticas no Plano de Contas)
         records_before_post = len(records)
         records = self.post_process(records)
         if len(records) != records_before_post:
@@ -660,15 +606,14 @@ class Agent(ABC):
 
         if issues:
             records = self.self_review(records, issues)
-            # Pós-processa de novo caso self_review tenha reintroduzido sintéticas
             records = self.post_process(records)
-            issues = self.validate(records)  # re-valida após refino
+            issues = self.validate(records)
 
-        # Garantir que todos os campos do schema existam em cada registro
         all_fields = self.structure.all_fields
-        normalized = []
-        for rec in records:
-            normalized.append({f: str(rec.get(f, "")).strip() for f in all_fields})
+        normalized = [
+            {f: str(rec.get(f, "")).strip() for f in all_fields}
+            for rec in records
+        ]
 
         return {
             "structure_id": self.structure_id,
@@ -707,9 +652,9 @@ class Triager:
         api_key: str | None = None,
         model: str | None = None,
     ):
-        self.api_key = api_key or os.environ["ANTHROPIC_API_KEY"]
-        self.model = model or os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
-        self.client = Anthropic(api_key=self.api_key)
+        if api_key:
+            os.environ.setdefault("OPENROUTER_API_KEY", api_key)
+        self.model = model or get_model()
 
     def _tool_schema(self) -> Dict[str, Any]:
         structure_ids = [s.id for s in ALL_STRUCTURES]
@@ -746,30 +691,32 @@ class Triager:
         file_kind: FileKind,
         client_context: str = "",
     ) -> Dict[str, Any]:
-        """Retorna dict com structures_present, primary_structure, reasoning."""
         source_path = Path(source_path)
         doc_blocks = _document_blocks(source_path, file_kind)
         preamble = (
-            "Analise o documento abaixo e identifique quais das 4 estruturas do FP&A Base "
-            "estão presentes. Use a ferramenta `submit_triage` para retornar.\n\n"
+            "Analise o documento abaixo e identifique quais das 4 estruturas do "
+            "FP&A Base estão presentes. Use a ferramenta `submit_triage` para retornar.\n\n"
             f"Contexto adicional: {client_context or '(nenhum)'}"
         )
 
         content = [{"type": "text", "text": preamble}] + doc_blocks
         tool = self._tool_schema()
 
-        with self.client.messages.stream(
-            model=self.model,
-            max_tokens=1024,
-            system=TRIAGER_SYSTEM,
-            tools=[tool],
-            tool_choice={"type": "tool", "name": tool["name"]},
-            messages=[{"role": "user", "content": content}],
-        ) as stream:
-            final = stream.get_final_message()
+        try:
+            result = call_with_tool(
+                system=TRIAGER_SYSTEM,
+                user_content=content,
+                tool_schema=tool,
+                model=self.model,
+                max_tokens=2048,
+                stream=False,
+            )
+        except Exception:
+            return {"structures_present": [], "primary_structure": "", "reasoning": ""}
 
-        for block in final.content:
-            if block.type == "tool_use" and block.name == tool["name"]:
-                return dict(block.input)
-
-        return {"structures_present": [], "primary_structure": "", "reasoning": ""}
+        tool_input = result.get("tool_input", {}) or {}
+        return {
+            "structures_present": tool_input.get("structures_present", []),
+            "primary_structure": tool_input.get("primary_structure", ""),
+            "reasoning": tool_input.get("reasoning", ""),
+        }
