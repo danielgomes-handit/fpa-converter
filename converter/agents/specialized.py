@@ -11,9 +11,105 @@ Cada agente tem:
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Type
+from typing import Any, Dict, List, Optional, Type
 
 from .base import Agent
+
+
+# =============================================================================
+# Utilitário compartilhado: detecção de separador hierárquico
+# =============================================================================
+
+def _detect_separator(codes: List[str]) -> str:
+    """Detecta o separador hierárquico majoritário ('.', '-', '/').
+
+    Retorna '' se nenhum candidato aparecer em pelo menos 30% dos códigos
+    (caso de códigos planos como '3010', '4020').
+    """
+    candidates = [".", "-", "/"]
+    scores: Dict[str, int] = {c: 0 for c in candidates}
+    valid_codes = [c for c in codes if c]
+    if not valid_codes:
+        return "."
+    for cod in valid_codes:
+        for sep in candidates:
+            if sep in cod:
+                scores[sep] += 1
+    best_sep = max(candidates, key=lambda s: (scores[s], -candidates.index(s)))
+    if scores[best_sep] >= max(1, len(valid_codes) * 0.3):
+        return best_sep
+    return ""
+
+
+def _rebuild_hierarchy(
+    records: List[Dict[str, Any]],
+    code_field: str,
+    desc_field: str,
+    n_field_prefix: str,
+    levels: int = 5,
+) -> List[Dict[str, Any]]:
+    """Filtra sintéticos + reconstrói N1..N{levels} usando o código hierárquico.
+
+    Args:
+        records: lista de registros (sintéticos + analíticos)
+        code_field: nome do campo com código hierárquico (ex: 'CONTA_CONTABIL_COD',
+            'CC_CLASS', 'CC_COD')
+        desc_field: nome do campo de descrição (ex: 'CONTA_CONTABIL_DESC', 'CC_DESC')
+        n_field_prefix: prefixo dos campos N (ex: 'CONTA_N' ou 'CC_N')
+        levels: profundidade da hierarquia (default 5)
+
+    Retorna lista filtrada com hierarquia reconstruída.
+    """
+    code_pattern = re.compile(r"^[\w.\-/]+$")
+    sep = _detect_separator([
+        str(r.get(code_field, "")).strip() for r in records
+    ])
+
+    code_to_desc: Dict[str, str] = {}
+    all_codes: set = set()
+    for rec in records:
+        cod = str(rec.get(code_field, "")).strip()
+        desc = str(rec.get(desc_field, "")).strip()
+        if not cod:
+            continue
+        all_codes.add(cod)
+        if desc and desc != cod:
+            code_to_desc[cod] = desc
+
+    def _is_synthetic(code: str) -> bool:
+        if not code or not sep:
+            return False
+        prefix = code + sep
+        return any(other.startswith(prefix) for other in all_codes if other != code)
+
+    processed: List[Dict[str, Any]] = []
+    for rec in records:
+        cod = str(rec.get(code_field, "")).strip()
+        if not cod or _is_synthetic(cod):
+            continue
+
+        for level in range(1, levels + 1):
+            rec[f"{n_field_prefix}{level}_COD"] = ""
+            rec[f"{n_field_prefix}{level}_DESC"] = ""
+
+        if sep and code_pattern.match(cod) and sep in cod:
+            parts = cod.split(sep)
+            for level in range(1, levels + 1):
+                if level <= len(parts):
+                    prefix = sep.join(parts[:level])
+                    rec[f"{n_field_prefix}{level}_COD"] = prefix
+                    if prefix in code_to_desc:
+                        rec[f"{n_field_prefix}{level}_DESC"] = code_to_desc[prefix]
+
+        for level in range(1, levels + 1):
+            c = str(rec.get(f"{n_field_prefix}{level}_COD", "")).strip()
+            d = str(rec.get(f"{n_field_prefix}{level}_DESC", "")).strip()
+            if c and d == c:
+                rec[f"{n_field_prefix}{level}_DESC"] = ""
+
+        processed.append(rec)
+
+    return processed
 
 
 # =============================================================================
@@ -83,52 +179,90 @@ class CentroDeCustoAgent(Agent):
     def system_prompt(self) -> str:
         return (
             "Você é um especialista em controladoria e estruturação de centros de "
-            "custo para empresas brasileiras. Sua tarefa é extrair CCs com toda a "
-            "hierarquia disponível (Tipo, Gerência, Diretoria, níveis N1-N5).\n\n"
-            "Regras de ouro:\n"
-            "1. CC_COD é obrigatório e deve ser o código reduzido (único por CC).\n"
-            "2. CC_CLASS, quando existe, é o código de classificação hierárquica "
-            "(ex.: '01.01.001') que codifica os níveis. Preserve o formato original.\n"
-            "3. Para CCs hierárquicos (ex.: '001.001.002'), derive automaticamente "
-            "CC_N1_COD..CC_N5_COD quebrando pelo ponto. CC_N1_DESC..CC_N5_DESC use o "
-            "nome do nó pai se disponível na mesma tabela ou em outra seção do documento.\n"
+            "custo para empresas brasileiras. Sua tarefa é extrair o cadastro "
+            "completo de CCs (tanto agrupadores/sintéticos quanto analíticos).\n\n"
+            "IMPORTANTE — extraia TODOS os CCs (agrupadores + analíticos):\n"
+            "- CCs AGRUPADORES (sintéticos, totalizadores como 'DIRETORIAS', "
+            "'COMERCIAL', 'OPERAÇÕES') → EXTRAIA como linhas normais.\n"
+            "- CCs ANALÍTICOS (folha da hierarquia, recebem lançamento) → EXTRAIA "
+            "como linhas normais.\n"
+            "- Um pós-processamento automático vai remover os agrupadores do arquivo "
+            "final e usar suas descrições para preencher CC_N1..CC_N5 dos analíticos. "
+            "Por isso precisamos de TODOS no retorno.\n\n"
+            "Regras por campo:\n"
+            "1. CC_COD: código do CC (obrigatório). Se houver código reduzido único, "
+            "use ele. Se o cliente só usa código hierárquico (001.001.002), use esse.\n"
+            "2. CC_DESC: NOME do CC (obrigatório). NUNCA coloque o código aqui.\n"
+            "3. CC_CLASS: código hierárquico/de classificação (ex.: '01.01.001'). "
+            "Pode ser igual ao CC_COD se o cliente não tiver código separado. "
+            "Preserve o formato original (ponto, hífen ou barra).\n"
             "4. TIPO, GERENCIA, DIRETORIA: preencha se houver informação explícita. "
-            "Nunca invente. Se não houver, deixe vazio e anote em notes.\n"
-            "5. Cada CC deve aparecer UMA só vez. Se o mesmo CC_COD aparecer em "
-            "múltiplas filiais (Omie replica), consolide e registre em notes.\n"
-            "6. Ignore linhas que são apenas cabeçalhos de hierarquia (linhas sem "
-            "CC_COD reduzido, apenas com código estruturado de nível superior)."
+            "NUNCA invente. Se não houver, deixe vazio.\n"
+            "5. CC_N1..N5 (COD e DESC): você NÃO precisa preencher. O "
+            "pós-processamento reconstrói a hierarquia automaticamente. Deixe vazios.\n"
+            "6. Deduplicar por CC_COD."
         )
 
     def extract_instructions(self) -> str:
         return (
-            "Procure no documento:\n"
+            "Procure no documento TODAS as linhas de centros de custo:\n"
             "- Colunas como 'Centro de Custo', 'CC', 'Department', 'Departamento', "
-            "'Cost Center', 'Código CC'\n"
-            "- Hierarquia: Diretoria > Gerência > Área > CC\n"
-            "- Códigos pontuados (ex.: 001.001.002) indicam hierarquia\n"
-            "- Colunas 'Tipo' (Administrativo, Produção, etc.) e 'Gerência'\n\n"
-            "Se o documento tem estrutura hierárquica implícita (níveis em colunas "
-            "separadas), consolide na linha do CC folha, preenchendo CC_N1..CC_N5."
+            "'Cost Center', 'Código CC', 'Classificação'.\n"
+            "- Estrutura hierárquica: Diretoria > Gerência > Área > CC.\n"
+            "- Códigos pontuados/hifenizados (ex.: '001.001.002', '01-02-003') "
+            "indicam profundidade. Mantenha o formato original.\n"
+            "- Para cada CC, preencha CC_COD, CC_DESC e (quando possível) CC_CLASS, "
+            "TIPO, GERENCIA, DIRETORIA. Os campos CC_N1..N5 ficam VAZIOS — o "
+            "pós-processamento reconstrói.\n\n"
+            "Extraia TODOS os CCs, sem filtrar agrupadores."
         )
+
+    def extra_chunk_instruction(self) -> str:
+        return (
+            "⚠️ REFORÇO SOBRE AGRUPADORES (importante):\n"
+            "Em CADA parte do documento que processar, SEMPRE inclua como linhas "
+            "do CSV os CCs agrupadores (totalizadores) que sejam pais dos CCs "
+            "analíticos dessa parte. Sem isso, a hierarquia CC_N1..N5 não pode ser "
+            "reconstruída com os nomes corretos.\n\n"
+            "Não tem problema repetir entre chunks: a deduplicação é automática."
+        )
+
+    def post_process(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Pós-processa o cadastro de CCs.
+
+        1. Decide qual campo usar como código hierárquico:
+           - Se CC_CLASS estiver preenchido em pelo menos 50% dos registros, usa CC_CLASS.
+           - Senão, usa CC_COD.
+        2. Filtra agrupadores (CCs cujo código é prefixo de outro).
+        3. Reconstrói CC_N1..N5 (COD + DESC).
+        """
+        if not records:
+            return records
+
+        non_empty_class = sum(
+            1 for r in records if str(r.get("CC_CLASS", "")).strip()
+        )
+        use_class = non_empty_class >= max(1, len(records) * 0.5)
+        code_field = "CC_CLASS" if use_class else "CC_COD"
+
+        processed = _rebuild_hierarchy(
+            records,
+            code_field=code_field,
+            desc_field="CC_DESC",
+            n_field_prefix="CC_N",
+            levels=5,
+        )
+
+        # CC_CLASS: se vazio, usa o próprio CC_COD (compatível com formato Handit)
+        for rec in processed:
+            cc_cod = str(rec.get("CC_COD", "")).strip()
+            if cc_cod and not str(rec.get("CC_CLASS", "")).strip():
+                rec["CC_CLASS"] = cc_cod
+
+        return processed
 
     def custom_validations(self, records: List[Dict[str, Any]]) -> List[str]:
         issues: List[str] = []
-
-        for i, rec in enumerate(records, 1):
-            cc_class = str(rec.get("CC_CLASS", "")).strip()
-            if cc_class and "." in cc_class:
-                parts = cc_class.split(".")
-                for level_idx, level_part in enumerate(parts[:5], 1):
-                    expected_key = ".".join(parts[:level_idx])
-                    n_cod = str(rec.get(f"CC_N{level_idx}_COD", "")).strip()
-                    if n_cod and n_cod != expected_key:
-                        issues.append(
-                            f"Registro #{i} (CC_COD={rec.get('CC_COD')}): "
-                            f"CC_N{level_idx}_COD='{n_cod}' não bate com a quebra "
-                            f"esperada '{expected_key}' de CC_CLASS='{cc_class}'."
-                        )
-                        break
 
         for i, rec in enumerate(records, 1):
             cc_cod = str(rec.get("CC_COD", "")).strip()
@@ -232,109 +366,23 @@ class PlanoDeContasAgent(Agent):
     def post_process(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Pós-processamento determinístico após extração do Claude.
 
-        Estratégia: o Claude agora extrai TODAS as contas (sintéticas + analíticas).
-        Aqui nós:
-        1. Detectamos qual separador hierárquico o cliente usa ('.', '-' ou '/').
-        2. Construímos um mapa código → descrição usando TODAS as linhas.
-        3. Removemos as sintéticas (códigos que são prefixo de algum outro código).
-        4. Reconstruímos CONTA_N1..N5 (COD e DESC) a partir do código da conta
-           analítica e das descrições coletadas.
+        Estratégia: o Claude extrai TODAS as contas (sintéticas + analíticas).
+        Aqui filtramos as sintéticas e reconstruímos CONTA_N1..N5 a partir do
+        código da analítica + descrições coletadas.
         """
-        # 1) Detecta o separador hierárquico majoritário nos códigos
-        sep = self._detect_hierarchy_separator(records)
-
-        # Regex tolerante: aceita dígitos, letras, pontos e hífens (nessa ordem,
-        # cobre a maioria dos planos brasileiros).
-        # Exige pelo menos um caractere alfanumérico para evitar matches vazios.
-        code_pattern = re.compile(r"^[\w.\-/]+$")
-
-        # 2) Mapa código → descrição usando TODAS as linhas (sintéticas + analíticas)
-        code_to_desc: Dict[str, str] = {}
-        all_codes = set()
-        for rec in records:
+        processed = _rebuild_hierarchy(
+            records,
+            code_field="CONTA_CONTABIL_COD",
+            desc_field="CONTA_CONTABIL_DESC",
+            n_field_prefix="CONTA_N",
+            levels=5,
+        )
+        # CONTA_CONTABIL_CLASS: se vazio, usa o próprio COD
+        for rec in processed:
             cod = str(rec.get("CONTA_CONTABIL_COD", "")).strip()
-            desc = str(rec.get("CONTA_CONTABIL_DESC", "")).strip()
-            if not cod:
-                continue
-            all_codes.add(cod)
-            # Só aceita descrição se for diferente do próprio código (evita ruído).
-            if desc and desc != cod:
-                code_to_desc[cod] = desc
-
-        def _is_synthetic(code: str) -> bool:
-            """Conta é sintética se algum outro código começa com 'code + sep'."""
-            if not code or not sep:
-                return False
-            prefix = code + sep
-            return any(other.startswith(prefix) for other in all_codes if other != code)
-
-        # 3) Mantém apenas analíticas e reconstrói hierarquia
-        processed: List[Dict[str, Any]] = []
-        for rec in records:
-            cod = str(rec.get("CONTA_CONTABIL_COD", "")).strip()
-            if not cod or _is_synthetic(cod):
-                continue
-
-            # Zera CONTA_N*_COD/DESC antes de reconstruir
-            for level in range(1, 6):
-                rec[f"CONTA_N{level}_COD"] = ""
-                rec[f"CONTA_N{level}_DESC"] = ""
-
-            # Reconstrói hierarquia a partir do código (usando o separador detectado)
-            if sep and code_pattern.match(cod) and sep in cod:
-                parts = cod.split(sep)
-                for level in range(1, 6):
-                    if level <= len(parts):
-                        prefix = sep.join(parts[:level])
-                        rec[f"CONTA_N{level}_COD"] = prefix
-                        if prefix in code_to_desc:
-                            rec[f"CONTA_N{level}_DESC"] = code_to_desc[prefix]
-
-            # Sanidade: se CONTA_N*_DESC ficou igual ao COD, limpa
-            for level in range(1, 6):
-                c = str(rec.get(f"CONTA_N{level}_COD", "")).strip()
-                d = str(rec.get(f"CONTA_N{level}_DESC", "")).strip()
-                if c and d == c:
-                    rec[f"CONTA_N{level}_DESC"] = ""
-
-            # CONTA_CONTABIL_CLASS: se vazio, usa o próprio COD
-            if not str(rec.get("CONTA_CONTABIL_CLASS", "")).strip():
+            if cod and not str(rec.get("CONTA_CONTABIL_CLASS", "")).strip():
                 rec["CONTA_CONTABIL_CLASS"] = cod
-
-            processed.append(rec)
-
         return processed
-
-    @staticmethod
-    def _detect_hierarchy_separator(records: List[Dict[str, Any]]) -> str:
-        """Detecta o separador hierárquico majoritário usado nos códigos.
-
-        Testa '.', '-', '/' e retorna o que aparece com mais consistência.
-        Retorna '' se nenhum candidato for usado de forma significativa.
-        """
-        candidates = [".", "-", "/"]
-        scores: Dict[str, int] = {c: 0 for c in candidates}
-
-        codes = [
-            str(r.get("CONTA_CONTABIL_COD", "")).strip()
-            for r in records
-            if str(r.get("CONTA_CONTABIL_COD", "")).strip()
-        ]
-        if not codes:
-            return "."
-
-        for cod in codes:
-            for sep in candidates:
-                if sep in cod:
-                    scores[sep] += 1
-
-        # Pega o separador com mais ocorrências (desempate: ponto > hífen > barra)
-        best_sep = max(candidates, key=lambda s: (scores[s], -candidates.index(s)))
-        # Só retorna se foi usado em pelo menos 30% dos códigos (heurística contra
-        # códigos planos como "3010" sem hierarquia)
-        if scores[best_sep] >= max(1, len(codes) * 0.3):
-            return best_sep
-        return ""
 
     def custom_validations(self, records: List[Dict[str, Any]]) -> List[str]:
         issues: List[str] = []
@@ -371,7 +419,9 @@ class PlanoDeContasAgent(Agent):
 
         # Detecta se o Claude trocou _COD por _DESC (colocou descrição no campo de código).
         # Usa o separador detectado nos próprios dados.
-        sep = self._detect_hierarchy_separator(records)
+        sep = _detect_separator([
+            str(r.get("CONTA_CONTABIL_COD", "")).strip() for r in records
+        ])
         code_pattern = re.compile(r"^[\w.\-/]+$")
         swapped_count = 0
         first_sample = None
