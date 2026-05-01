@@ -6,6 +6,7 @@ Fluxo:
 """
 
 import os
+import re
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -275,6 +276,79 @@ st.markdown("""
     @keyframes fpa-spin {
         from { transform: rotate(0deg); }
         to { transform: rotate(360deg); }
+    }
+    /* Cards de alertas com diagnóstico */
+    .fpa-alert {
+        background: white;
+        border: 1px solid #EAECF0;
+        border-left: 4px solid #94A3B8;
+        border-radius: 10px;
+        padding: 1rem 1.25rem;
+        margin-bottom: 0.75rem;
+        font-size: 0.9rem;
+    }
+    .fpa-alert.alert-error { border-left-color: #DC2626; background: #FEF2F2; }
+    .fpa-alert.alert-warning { border-left-color: #F59E0B; background: #FFFBEB; }
+    .fpa-alert .alert-header {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        margin-bottom: 0.5rem;
+    }
+    .fpa-alert .alert-icon { font-size: 1.1rem; }
+    .fpa-alert .alert-title {
+        font-weight: 700;
+        color: #1B355B;
+        flex: 1;
+        font-size: 0.95rem;
+    }
+    .fpa-alert .alert-structure {
+        font-size: 0.72rem;
+        font-weight: 600;
+        background: #F1F5F9;
+        color: #475569;
+        padding: 0.18rem 0.55rem;
+        border-radius: 12px;
+        letter-spacing: 0.02em;
+        text-transform: uppercase;
+    }
+    .fpa-alert.alert-error .alert-structure { background: #FEE2E2; color: #991B1B; }
+    .fpa-alert.alert-warning .alert-structure { background: #FEF3C7; color: #92400E; }
+    .fpa-alert .alert-summary {
+        color: #334155;
+        line-height: 1.55;
+        margin-bottom: 0.5rem;
+    }
+    .fpa-alert .alert-action {
+        background: rgba(255, 255, 255, 0.7);
+        border: 1px dashed #CBD5E1;
+        border-radius: 8px;
+        padding: 0.6rem 0.85rem;
+        font-size: 0.82rem;
+        color: #1B355B;
+        margin-top: 0.5rem;
+    }
+    .fpa-alert .alert-action b { color: #00A670; }
+    .fpa-alert .alert-raw {
+        margin-top: 0.5rem;
+        font-size: 0.78rem;
+    }
+    .fpa-alert .alert-raw summary {
+        cursor: pointer;
+        color: #64748B;
+        user-select: none;
+    }
+    .fpa-alert .alert-raw code {
+        display: block;
+        background: #F8FAFC;
+        border: 1px solid #E2E8F0;
+        border-radius: 6px;
+        padding: 0.5rem;
+        margin-top: 0.4rem;
+        font-size: 0.72rem;
+        color: #475569;
+        word-break: break-word;
+        white-space: pre-wrap;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -584,22 +658,191 @@ if st.session_state.orchestration and st.session_state.zip_bytes:
                     delta_color=("normal" if not issues else "inverse"),
                 )
 
-    all_alerts = []
+    # ----- Classificação de alertas -------------------------------------------
+    def _classify_alert(message: str) -> dict:
+        """Classifica um alerta em tipo, ícone, severidade e ação sugerida."""
+        m = message.lower()
+
+        # Saldo do OpenRouter insuficiente
+        if "402" in m or "requires more credits" in m or "can only afford" in m:
+            afford_match = re.search(r"can only afford (\d+)", message)
+            current_match = re.search(r"requested up to (\d+)", message)
+            current = current_match.group(1) if current_match else "?"
+            afford = afford_match.group(1) if afford_match else "?"
+            return {
+                "icon": "💳",
+                "severity": "error",
+                "title": "Saldo do OpenRouter insuficiente para esta requisição",
+                "summary": (f"O modelo pediu até {current} tokens, mas seu saldo "
+                            f"só permite {afford} tokens por chamada."),
+                "action": (
+                    "Adicione saldo em https://openrouter.ai/credits OU reduza "
+                    "`CLAUDE_MAX_TOKENS` nos secrets do Streamlit (ex.: 16000)."
+                ),
+                "raw": message,
+            }
+        # Auth / chave inválida
+        if "401" in m or "user not found" in m or "invalid api key" in m:
+            return {
+                "icon": "🔑",
+                "severity": "error",
+                "title": "Chave da API inválida ou não reconhecida",
+                "summary": "O OpenRouter rejeitou a autenticação.",
+                "action": (
+                    "Verifique `OPENROUTER_API_KEY` nos secrets do Streamlit. "
+                    "A chave deve começar com `sk-or-v1-` (não use a da Anthropic)."
+                ),
+                "raw": message,
+            }
+        # Rate limit
+        if "429" in m or "rate limit" in m or "too many requests" in m:
+            return {
+                "icon": "⏱️",
+                "severity": "warning",
+                "title": "Limite de taxa do OpenRouter atingido",
+                "summary": "Muitas chamadas em sequência ou modelo congestionado.",
+                "action": (
+                    "Aguarde 1-2 min e tente de novo. Se persistir, troque o "
+                    "modelo do agente (ex.: Sonnet em vez de Opus)."
+                ),
+                "raw": message,
+            }
+        # Timeout
+        if "timeout" in m or "timed out" in m or "connection" in m:
+            return {
+                "icon": "🐢",
+                "severity": "warning",
+                "title": "Timeout na chamada ao LLM",
+                "summary": "O modelo demorou mais que o esperado.",
+                "action": (
+                    "Aumente `CLAUDE_TIMEOUT_SECONDS` (default 300) ou reduza "
+                    "o tamanho do arquivo. Para PDFs grandes, considere "
+                    "fragmentar manualmente."
+                ),
+                "raw": message,
+            }
+        # Modelo não encontrado
+        if "404" in m or "model not found" in m or "no such model" in m:
+            return {
+                "icon": "🔎",
+                "severity": "error",
+                "title": "Modelo não encontrado no OpenRouter",
+                "summary": "O slug do modelo configurado não existe.",
+                "action": (
+                    "Confirme o slug em https://openrouter.ai/models e ajuste "
+                    "`CLAUDE_MODEL` ou `MODEL_<AGENTE>` nos secrets."
+                ),
+                "raw": message,
+            }
+        # Nenhum registro extraído
+        if "nenhum registro" in m:
+            return {
+                "icon": "📭",
+                "severity": "warning",
+                "title": "Agente não encontrou registros",
+                "summary": ("O agente rodou mas não conseguiu extrair nada do "
+                            "documento. Pode ser que essa estrutura realmente "
+                            "não exista no arquivo, ou que o layout não tenha "
+                            "sido reconhecido."),
+                "action": (
+                    "Verifique o expander de debug abaixo para ver o erro exato "
+                    "dos logs do agente."
+                ),
+                "raw": message,
+            }
+        # Falha genérica do agente
+        if "falha no agente" in m or "error code" in m:
+            return {
+                "icon": "⚠️",
+                "severity": "error",
+                "title": "Falha durante a extração",
+                "summary": message[:200],
+                "action": "Veja o expander de debug para o stack trace completo.",
+                "raw": message,
+            }
+        # Cruzamento entre estruturas
+        if "(cruzamento)" in message:
+            return {
+                "icon": "🔗",
+                "severity": "warning",
+                "title": "Inconsistência entre estruturas",
+                "summary": message.split("(cruzamento):", 1)[-1].strip() or message,
+                "action": (
+                    "Revise os xlsx gerados antes de fazer upload. Pode ser CC "
+                    "ou conta referenciada que não existe no cadastro."
+                ),
+                "raw": message,
+            }
+        # Default: warning genérico
+        return {
+            "icon": "ℹ️",
+            "severity": "warning",
+            "title": "Alerta de validação",
+            "summary": message,
+            "action": "",
+            "raw": message,
+        }
+
+    raw_alerts = []
     for sid, out in orchestration.agent_outputs.items():
         label = get_structure(sid).label
         for issue in out.get("remaining_issues", []):
-            all_alerts.append(f"**{label}**: {issue}")
+            raw_alerts.append((label, str(issue), False))
+        # Se algum log do agente tem erro, eleva como alerta também
+        for log_entry in out.get("log", []):
+            err = log_entry.get("error") if isinstance(log_entry, dict) else None
+            if err:
+                raw_alerts.append((label, str(err), False))
 
     if st.session_state.validations:
         for sid, v in st.session_state.validations.items():
             label = get_structure(sid).label
             for err in v.errors:
-                all_alerts.append(f"**{label}** (cruzamento): {err}")
+                raw_alerts.append((label, f"(cruzamento) {err}", True))
 
-    if all_alerts:
-        with st.expander(f"{len(all_alerts)} alertas para revisar antes do upload"):
-            for a in all_alerts:
-                st.markdown(f"- {a}")
+    # Deduplica mensagens iguais por estrutura
+    seen = set()
+    classified = []
+    for label, msg, _ in raw_alerts:
+        key = (label, msg[:200])
+        if key in seen:
+            continue
+        seen.add(key)
+        info = _classify_alert(msg)
+        info["structure"] = label
+        classified.append(info)
+
+    if classified:
+        n_errors = sum(1 for a in classified if a["severity"] == "error")
+        n_warnings = sum(1 for a in classified if a["severity"] == "warning")
+        title = f"{len(classified)} alerta(s) para revisar"
+        if n_errors:
+            title = f"⚠️ {n_errors} erro(s) e {n_warnings} aviso(s) — revisar antes do upload"
+        with st.expander(title, expanded=bool(n_errors)):
+            for a in classified:
+                sev_class = f"alert-{a['severity']}"
+                action_html = (
+                    f'<div class="alert-action"><b>O que fazer:</b> {a["action"]}</div>'
+                    if a.get("action") else ""
+                )
+                raw_html = (
+                    f'<details class="alert-raw"><summary>Mensagem técnica</summary>'
+                    f'<code>{a["raw"][:600]}</code></details>'
+                    if a.get("raw") and a["raw"] != a["summary"] else ""
+                )
+                st.markdown(
+                    f'<div class="fpa-alert {sev_class}">'
+                    f'<div class="alert-header">'
+                    f'<span class="alert-icon">{a["icon"]}</span>'
+                    f'<span class="alert-title">{a["title"]}</span>'
+                    f'<span class="alert-structure">{a["structure"]}</span>'
+                    f'</div>'
+                    f'<div class="alert-summary">{a["summary"]}</div>'
+                    f'{action_html}'
+                    f'{raw_html}'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
 
     # Preview dos arquivos gerados
     if orchestration.dfs:
