@@ -223,6 +223,59 @@ st.markdown("""
         font-size: 0.9rem;
         box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
     }
+    /* Checklist de etapas */
+    .fpa-checklist {
+        background: white;
+        border: 1px solid #EAECF0;
+        border-radius: 12px;
+        padding: 1.25rem 1.5rem;
+        margin: 1rem 0 0.75rem 0;
+        box-shadow: 0 1px 3px rgba(16, 24, 40, 0.04);
+    }
+    .fpa-step {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        padding: 0.5rem 0;
+        font-size: 0.95rem;
+        border-bottom: 1px solid #F4F6F8;
+        transition: all 0.2s ease;
+    }
+    .fpa-step:last-child { border-bottom: none; }
+    .fpa-step .step-icon {
+        font-size: 1.05rem;
+        width: 1.5rem;
+        text-align: center;
+        flex-shrink: 0;
+    }
+    .fpa-step .step-label {
+        flex: 1;
+        color: #1B355B;
+        font-weight: 500;
+    }
+    .fpa-step .step-detail {
+        color: #5A6475;
+        font-size: 0.82rem;
+        font-weight: 400;
+    }
+    .fpa-step.step-pending .step-icon { color: #CBD5E1; }
+    .fpa-step.step-pending .step-label { color: #94A3B8; font-weight: 400; }
+    .fpa-step.step-running { background: linear-gradient(90deg, #F0FDF4 0%, transparent 100%); margin: 0 -0.5rem; padding-left: 0.5rem; padding-right: 0.5rem; border-radius: 6px; }
+    .fpa-step.step-running .step-icon {
+        animation: fpa-spin 1.6s linear infinite;
+        display: inline-block;
+    }
+    .fpa-step.step-running .step-label { color: #00A670; font-weight: 600; }
+    .fpa-step.step-done .step-icon { color: #00C389; }
+    .fpa-step.step-done .step-label { color: #1B355B; }
+    .fpa-step.step-failed .step-icon { color: #DC2626; }
+    .fpa-step.step-failed .step-label { color: #991B1B; }
+    .fpa-step.step-skipped .step-icon { color: #94A3B8; }
+    .fpa-step.step-skipped .step-label { color: #64748B; text-decoration: line-through; }
+    @keyframes fpa-spin {
+        from { transform: rotate(0deg); }
+        to { transform: rotate(360deg); }
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -331,39 +384,163 @@ if uploaded is not None:
     if st.button("Converter para formato Handit", type="primary", use_container_width=True):
         try:
             client_name = Path(uploaded.name).stem
-            status_placeholder = st.empty()
+
+            # ----- Checklist visual ------------------------------------------------
+            STRUCTURE_LABELS = {
+                "estrutura_empresarial": "Estrutura Empresarial",
+                "centro_de_custo": "Centro de Custo",
+                "plano_de_contas": "Plano de Contas",
+                "razao_contabil": "Razão Contábil",
+            }
+            checklist_placeholder = st.empty()
+            substatus_placeholder = st.empty()
+
+            # Estado inicial: só a etapa de triagem (resto é descoberto após triage)
+            checklist_state = {
+                "steps": [
+                    {"id": "triage", "label": "Analisar documento e identificar estruturas",
+                     "status": "running", "detail": ""},
+                ],
+            }
+
+            def _render_checklist():
+                icons = {
+                    "pending": "○", "running": "⏳",
+                    "done": "✅", "failed": "❌", "skipped": "⊘",
+                }
+                lines = ['<div class="fpa-checklist">']
+                for step in checklist_state["steps"]:
+                    icon = icons.get(step["status"], "○")
+                    cls = f"step-{step['status']}"
+                    detail = (
+                        f' <span class="step-detail">{step["detail"]}</span>'
+                        if step.get("detail") else ""
+                    )
+                    lines.append(
+                        f'<div class="fpa-step {cls}">'
+                        f'<span class="step-icon">{icon}</span>'
+                        f'<span class="step-label">{step["label"]}</span>'
+                        f'{detail}'
+                        f'</div>'
+                    )
+                lines.append('</div>')
+                checklist_placeholder.markdown("\n".join(lines), unsafe_allow_html=True)
+
+            def _set_step(step_id: str, **updates):
+                for step in checklist_state["steps"]:
+                    if step["id"] == step_id:
+                        step.update(updates)
+                        break
+
+            def _add_step(step_id: str, label: str, status: str = "pending"):
+                if any(s["id"] == step_id for s in checklist_state["steps"]):
+                    return
+                checklist_state["steps"].append(
+                    {"id": step_id, "label": label, "status": status, "detail": ""}
+                )
+
+            def _on_event(event_type, **kwargs):
+                if event_type == "triage_done":
+                    structures = kwargs.get("structures", [])
+                    reasoning = kwargs.get("reasoning", "")
+                    fb = kwargs.get("fallback_all", False)
+                    detail = (
+                        f"{len(structures)} estrutura(s) identificada(s)"
+                        + (" · fallback (rodando todas)" if fb else "")
+                    )
+                    _set_step("triage", status="done", detail=detail)
+                    # Adiciona uma etapa por estrutura identificada
+                    for sid in structures:
+                        _add_step(
+                            f"agent_{sid}",
+                            f"Extrair {STRUCTURE_LABELS.get(sid, sid)}",
+                            status="pending",
+                        )
+                    # Etapas finais (validação + outputs)
+                    _add_step("validations", "Validar cruzamentos entre estruturas")
+                    _add_step("outputs", "Gerar pacote Handit (zip)")
+                    if reasoning:
+                        substatus_placeholder.caption(f"_Triagem:_ {reasoning}")
+                    _render_checklist()
+                elif event_type == "agent_start":
+                    sid = kwargs.get("structure_id", "")
+                    _set_step(f"agent_{sid}", status="running")
+                    _render_checklist()
+                elif event_type == "agent_done":
+                    sid = kwargs.get("structure_id", "")
+                    n = kwargs.get("records_count", 0)
+                    issues = kwargs.get("issues_count", 0)
+                    if n == 0:
+                        detail = "0 registros (nada extraído)"
+                        status = "skipped"
+                    elif issues:
+                        detail = f"{n} registros · {issues} alerta(s)"
+                        status = "done"
+                    else:
+                        detail = f"{n} registros"
+                        status = "done"
+                    _set_step(f"agent_{sid}", status=status, detail=detail)
+                    _render_checklist()
+                elif event_type == "agent_failed":
+                    sid = kwargs.get("structure_id", "")
+                    err = kwargs.get("error", "")
+                    _set_step(f"agent_{sid}", status="failed",
+                              detail=str(err)[:80])
+                    _render_checklist()
 
             def _progress(label: str):
-                status_placeholder.markdown(
+                # Sublabel pra mostrar atividade atual abaixo do checklist
+                substatus_placeholder.markdown(
                     f'<div class="agent-step">⚡ {label}</div>',
                     unsafe_allow_html=True,
                 )
+
+            _render_checklist()
 
             orchestration = run_orchestration(
                 source_path=str(tmp_path),
                 file_kind=kind,
                 client_context="",
                 progress_callback=_progress,
+                on_event=_on_event,
             )
             st.session_state.orchestration = orchestration
 
-            status_placeholder.empty()
+            # ----- Validações ------------------------------------------------------
+            _set_step("validations", status="running")
+            _render_checklist()
+            validations = validate_all(orchestration.dfs)
+            st.session_state.validations = validations
+            cross_issues = sum(len(v.errors) for v in validations.values())
+            _set_step(
+                "validations",
+                status="done",
+                detail=(f"{cross_issues} alerta(s) de cruzamento"
+                        if cross_issues else "sem inconsistências"),
+            )
+            _render_checklist()
 
-            with st.spinner("Validando cruzamentos entre estruturas..."):
-                validations = validate_all(orchestration.dfs)
-                st.session_state.validations = validations
-
-            with st.spinner("Gerando arquivos de carga..."):
-                zip_bytes = generate_outputs(
-                    client_name=client_name,
-                    source_filename=uploaded.name,
-                    file_kind=kind.value,
-                    mapping_or_extraction=orchestration.to_debug_dict(),
-                    dfs=orchestration.dfs,
-                    validations=validations,
-                )
-                st.session_state.zip_bytes = zip_bytes
-                st.session_state.client_name = client_name
+            # ----- Outputs ---------------------------------------------------------
+            _set_step("outputs", status="running")
+            _render_checklist()
+            zip_bytes = generate_outputs(
+                client_name=client_name,
+                source_filename=uploaded.name,
+                file_kind=kind.value,
+                mapping_or_extraction=orchestration.to_debug_dict(),
+                dfs=orchestration.dfs,
+                validations=validations,
+            )
+            st.session_state.zip_bytes = zip_bytes
+            st.session_state.client_name = client_name
+            n_files = len(orchestration.dfs)
+            _set_step(
+                "outputs",
+                status="done",
+                detail=f"{n_files} xlsx + relatório no pacote",
+            )
+            _render_checklist()
+            substatus_placeholder.empty()
 
             if orchestration.dfs:
                 st.success(

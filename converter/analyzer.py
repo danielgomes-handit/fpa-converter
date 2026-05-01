@@ -176,7 +176,7 @@ def _profile_column(series: pd.Series, n_samples: int = 5) -> ColumnProfile:
     )
 
 
-def _profile_sheet(df: pd.DataFrame, sheet_name: str, n_head: int = 5) -> SheetProfile:
+def _profile_sheet(df: pd.DataFrame, sheet_name: str, n_head: int = 10) -> SheetProfile:
     cols = [_profile_column(df[c]) for c in df.columns]
     head_md = ""
     if len(df):
@@ -220,7 +220,13 @@ def analyze_file(path: str | Path) -> FileProfile:
 
 def profile_to_prompt(profile: FileProfile, max_cols: int = 50) -> str:
     """Serializa o perfil em markdown para mandar ao Claude."""
-    parts = [f"# Arquivo: `{Path(profile.path).name}`", ""]
+    sheet_names = [s.name for s in profile.sheets]
+    parts = [
+        f"# Arquivo: `{Path(profile.path).name}`",
+        "",
+        f"**Total de abas:** {len(profile.sheets)} → {sheet_names}",
+        "",
+    ]
     for sheet in profile.sheets:
         parts.append(f"## Aba: `{sheet.name}` ({sheet.row_count} linhas)")
         parts.append("")
@@ -235,7 +241,7 @@ def profile_to_prompt(profile: FileProfile, max_cols: int = 50) -> str:
             parts.append(f"- ... e mais {len(sheet.columns) - max_cols} colunas")
         parts.append("")
         if sheet.head_markdown:
-            parts.append("### Amostra (5 primeiras linhas)")
+            parts.append("### Amostra (primeiras linhas)")
             parts.append("")
             parts.append(sheet.head_markdown)
             parts.append("")

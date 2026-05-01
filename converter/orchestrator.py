@@ -47,6 +47,7 @@ def run_orchestration(
     file_kind: FileKind,
     client_context: str = "",
     progress_callback=None,
+    on_event=None,
 ) -> OrchestrationResult:
     """Executa o fluxo completo de conversão com agentes.
 
@@ -55,16 +56,31 @@ def run_orchestration(
         file_kind: tipo de arquivo (saída do router.classify_file).
         client_context: contexto livre sobre o cliente.
         progress_callback: função opcional `(label: str) -> None` chamada
-            a cada passo, útil para atualizar spinners na UI.
+            a cada passo (mensagens textuais para spinners simples).
+        on_event: função opcional `(event_type: str, **kwargs) -> None`
+            chamada em momentos-chave do pipeline. Eventos:
+            - "triage_start"
+            - "triage_done" (structures: list[str], reasoning: str)
+            - "agent_start" (structure_id: str)
+            - "agent_done" (structure_id: str, records_count: int, issues_count: int)
+            - "agent_failed" (structure_id: str, error: str)
     """
 
     def _notify(label: str):
         if progress_callback:
             progress_callback(label)
 
+    def _emit(event_type: str, **kwargs):
+        if on_event:
+            try:
+                on_event(event_type, **kwargs)
+            except Exception:
+                pass  # eventos de UI não podem derrubar o pipeline
+
     source_path = Path(source_path)
 
     # 1. Triagem: identifica estruturas presentes
+    _emit("triage_start")
     _notify("Identificando estruturas presentes no documento...")
     triager = Triager()
     triage = triager.classify(source_path, file_kind, client_context)
@@ -80,6 +96,13 @@ def run_orchestration(
         ]
         triage["fallback_all"] = True
 
+    _emit(
+        "triage_done",
+        structures=structures_present,
+        reasoning=triage.get("reasoning", ""),
+        fallback_all=triage.get("fallback_all", False),
+    )
+
     # 2. Executa agentes relevantes
     agent_outputs: Dict[str, Dict[str, Any]] = {}
     dfs: Dict[str, pd.DataFrame] = {}
@@ -91,6 +114,7 @@ def run_orchestration(
             continue
 
         structure = get_structure(sid)
+        _emit("agent_start", structure_id=sid)
         _notify(f"Iniciando agente de {structure.label}...")
 
         agent = agent_cls(
@@ -108,18 +132,26 @@ def run_orchestration(
                 "remaining_issues": [f"Falha no agente: {e}"],
                 "log": [{"step": "error", "message": str(e)}],
             }
+            _emit("agent_failed", structure_id=sid, error=str(e))
 
         agent_outputs[sid] = output
 
         records = output.get("records", [])
+        issues = output.get("remaining_issues", []) or []
         if records:
             df = pd.DataFrame(records)
-            # Garantir ordem e presença de todos os campos
             for field_name in structure.all_fields:
                 if field_name not in df.columns:
                     df[field_name] = ""
             df = df[structure.all_fields]
             dfs[sid] = df
+
+        _emit(
+            "agent_done",
+            structure_id=sid,
+            records_count=len(records),
+            issues_count=len(issues),
+        )
 
     return OrchestrationResult(
         triage=triage,

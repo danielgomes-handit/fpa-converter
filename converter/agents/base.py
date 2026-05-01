@@ -662,17 +662,33 @@ As 4 estruturas possíveis são:
 - **plano_de_contas**: lista de contas contábeis. Campos típicos: código contábil, descrição da conta, natureza (D/C), hierarquia DRE.
 - **razao_contabil**: lançamentos contábeis ou movimentos. Campos típicos: data, valor, débito/crédito, histórico.
 
-Um mesmo documento pode ter várias estruturas (ex.: extração Omie com CCs + contas + lançamentos).
-Outros podem ter apenas uma (ex.: PDF só de Plano de Contas).
+REGRAS CRÍTICAS:
+1. **Documentos xlsx têm MÚLTIPLAS ABAS** (sheets). Você DEVE analisar TODAS as \
+abas listadas no profile, não só a primeira. Cada aba pode trazer uma estrutura \
+diferente. Um arquivo "Modelo Contábil" típico vem com 4 abas: Empresas, CCs, \
+Plano de Contas, Razão.
+2. Um mesmo documento pode ter VÁRIAS estruturas presentes ao mesmo tempo. \
+Inclua TODAS que tiverem evidência (ex.: extração Omie costuma ter CCs + contas \
++ lançamentos juntos).
+3. Use os NOMES DAS ABAS como pista forte: aba chamada "Centros de Custo" → \
+centro_de_custo. Aba "Lançamentos" ou "Razão" → razao_contabil. Aba "Plano de \
+Contas" ou "Categorias" → plano_de_contas. Aba "Empresas" ou "Filiais" → \
+estrutura_empresarial.
+4. Mesmo com amostra pequena (5 linhas), use os nomes das colunas como sinal: \
+"Data", "Valor", "Histórico" → razão. "Conta Contábil", "Natureza" → plano. \
+"CC", "Departamento" → centro_de_custo.
+5. Seja generoso na detecção: se há sinal mínimo de uma estrutura, INCLUA-A. É \
+melhor o agente dela rodar e voltar vazio do que perder uma estrutura presente.
 
-Seja conservador: só inclua uma estrutura se houver evidência clara no documento."""
+NÃO retorne lista vazia se houver QUALQUER evidência de estrutura financeira."""
 
 
 class Triager:
     """Identifica quais estruturas FP&A estão presentes num documento."""
 
-    # Default: Haiku (tarefa simples de classificação, não justifica Opus)
-    default_model: str = "anthropic/claude-haiku-4.5"
+    # Default: Sonnet (precisa enxergar múltiplas abas/seções e classificar
+    # corretamente. Haiku errava em arquivos multi-estrutura).
+    default_model: str = "anthropic/claude-sonnet-4.5"
 
     def __init__(
         self,
