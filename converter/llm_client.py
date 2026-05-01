@@ -58,6 +58,28 @@ def get_model() -> str:
     )
 
 
+def resolve_model_for_agent(agent_id: str, agent_default: Optional[str] = None) -> str:
+    """Resolve qual modelo usar para um agente específico.
+
+    Ordem de prioridade:
+    1. Env var específica do agente (ex: MODEL_PLANO_DE_CONTAS, MODEL_TRIAGER)
+    2. Default do próprio agente (passado pela subclasse)
+    3. Env global (OPENROUTER_MODEL ou CLAUDE_MODEL)
+    4. DEFAULT_MODEL
+
+    Isso permite override por agente sem editar código:
+        MODEL_TRIAGER=anthropic/claude-haiku-4.5
+        MODEL_PLANO_DE_CONTAS=anthropic/claude-opus-4.7
+    """
+    env_key = f"MODEL_{agent_id.upper()}"
+    specific = os.environ.get(env_key)
+    if specific:
+        return specific
+    if agent_default:
+        return agent_default
+    return get_model()
+
+
 def _to_openai_tool(anth_tool: Dict[str, Any]) -> Dict[str, Any]:
     """Converte schema de tool no formato Anthropic para o formato OpenAI."""
     return {

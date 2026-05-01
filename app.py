@@ -37,7 +37,9 @@ OPENROUTER_API_KEY = _get_secret("OPENROUTER_API_KEY")
 ANTHROPIC_API_KEY = _get_secret("ANTHROPIC_API_KEY")  # fallback / legado
 LLM_API_KEY = OPENROUTER_API_KEY or ANTHROPIC_API_KEY
 
-CLAUDE_MODEL = _get_secret("CLAUDE_MODEL") or _get_secret("OPENROUTER_MODEL", "anthropic/claude-opus-4.7")
+# Modelo global é OPCIONAL agora. Se vazio, cada agente usa seu default
+# (Haiku para Triager/Empresa, Sonnet para CC/Razão, Opus para Plano).
+CLAUDE_MODEL = _get_secret("CLAUDE_MODEL") or _get_secret("OPENROUTER_MODEL", "")
 CLAUDE_MAX_TOKENS = _get_secret("CLAUDE_MAX_TOKENS", "32000")
 APP_PASSWORD = _get_secret("APP_PASSWORD", "")
 MAX_UPLOAD_MB = int(_get_secret("MAX_UPLOAD_MB", "30"))
@@ -51,6 +53,18 @@ if CLAUDE_MODEL:
     os.environ["OPENROUTER_MODEL"] = CLAUDE_MODEL
 if CLAUDE_MAX_TOKENS:
     os.environ["CLAUDE_MAX_TOKENS"] = CLAUDE_MAX_TOKENS
+
+# Propaga overrides por agente (se configurados nos secrets do Streamlit)
+for agent_key in [
+    "MODEL_TRIAGER",
+    "MODEL_ESTRUTURA_EMPRESARIAL",
+    "MODEL_CENTRO_DE_CUSTO",
+    "MODEL_PLANO_DE_CONTAS",
+    "MODEL_RAZAO_CONTABIL",
+]:
+    val = _get_secret(agent_key, "")
+    if val:
+        os.environ[agent_key] = val
 
 
 _icon_path = Path("assets/handit-icon.png")

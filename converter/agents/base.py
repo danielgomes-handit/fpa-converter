@@ -24,7 +24,7 @@ from io import StringIO
 from pathlib import Path
 from typing import Any, Dict, List
 
-from ..llm_client import call_with_tool, get_model
+from ..llm_client import call_with_tool, get_model, resolve_model_for_agent
 from ..router import FileKind
 from ..schemas import ALL_STRUCTURES, StructureSpec, get_structure
 
@@ -297,6 +297,11 @@ class Agent(ABC):
 
     structure_id: str = ""
 
+    # Modelo padrão por agente. Subclasses override para usar modelos mais
+    # baratos em tarefas simples (ex: Haiku para Empresa, Sonnet para Razão).
+    # Pode ser sobrescrito via env var MODEL_<STRUCTURE_ID> em uppercase.
+    default_model: str | None = None
+
     def __init__(
         self,
         source_path: str | Path,
@@ -312,7 +317,11 @@ class Agent(ABC):
         # Compatibilidade com chamadas antigas que passam api_key explicitamente
         if api_key:
             os.environ.setdefault("OPENROUTER_API_KEY", api_key)
-        self.model = model or get_model()
+        # Resolve modelo: override explícito > env var por agente > default da subclasse > global
+        if model:
+            self.model = model
+        else:
+            self.model = resolve_model_for_agent(self.structure_id, self.default_model)
         self.max_tokens = int(os.environ.get("CLAUDE_MAX_TOKENS", "32000"))
         self.log: List[Dict[str, Any]] = []
         self.progress_callback = progress_callback
@@ -662,6 +671,9 @@ Seja conservador: só inclua uma estrutura se houver evidência clara no documen
 class Triager:
     """Identifica quais estruturas FP&A estão presentes num documento."""
 
+    # Default: Haiku (tarefa simples de classificação, não justifica Opus)
+    default_model: str = "anthropic/claude-haiku-4.5"
+
     def __init__(
         self,
         api_key: str | None = None,
@@ -669,7 +681,10 @@ class Triager:
     ):
         if api_key:
             os.environ.setdefault("OPENROUTER_API_KEY", api_key)
-        self.model = model or get_model()
+        if model:
+            self.model = model
+        else:
+            self.model = resolve_model_for_agent("triager", self.default_model)
 
     def _tool_schema(self) -> Dict[str, Any]:
         structure_ids = [s.id for s in ALL_STRUCTURES]

@@ -118,6 +118,8 @@ def _rebuild_hierarchy(
 
 class EmpresaAgent(Agent):
     structure_id = "estrutura_empresarial"
+    # Tarefa simples (poucos registros, campos básicos): Haiku é suficiente
+    default_model = "anthropic/claude-haiku-4.5"
 
     def key_field(self) -> str:
         return "FILIAL_COD"
@@ -172,6 +174,8 @@ class EmpresaAgent(Agent):
 
 class CentroDeCustoAgent(Agent):
     structure_id = "centro_de_custo"
+    # Hierarquia média + post_process determinístico: Sonnet entrega bem
+    default_model = "anthropic/claude-sonnet-4.5"
 
     def key_field(self) -> str:
         return "CC_COD"
@@ -281,6 +285,8 @@ class CentroDeCustoAgent(Agent):
 
 class PlanoDeContasAgent(Agent):
     structure_id = "plano_de_contas"
+    # Tarefa crítica (sintéticas vs analíticas, naturezas D/C, DRE): mantém Opus
+    default_model = "anthropic/claude-opus-4.7"
 
     def key_field(self) -> str:
         return "CONTA_CONTABIL_COD"
@@ -460,6 +466,8 @@ class PlanoDeContasAgent(Agent):
 
 class RazaoContabilAgent(Agent):
     structure_id = "razao_contabil"
+    # Volume alto + tarefa mecânica (data/valor/conta/CC/histórico): Sonnet
+    default_model = "anthropic/claude-sonnet-4.5"
 
     def key_field(self) -> str:
         return ""
