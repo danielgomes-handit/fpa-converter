@@ -165,20 +165,11 @@ def _df_to_text_block(path: Path, sheet_name: str, df, range_label: str = ""
 def _tabular_chunks(path: Path, rows_per_chunk: int = DEFAULT_TABULAR_ROWS_PER_CHUNK
                     ) -> List[List[Dict[str, Any]]]:
     """Divide xlsx/csv em chunks. Sempre envia conteúdo COMPLETO (não amostra)."""
-    import pandas as pd
-    from ..analyzer import _read_csv_smart
+    from ..analyzer import _read_csv_smart, _read_xlsx_like_smart
 
     try:
-        if path.suffix.lower() in {".xlsx", ".xlsm"}:
-            xls = pd.ExcelFile(path)
-            sheets_data = {}
-            for sheet_name in xls.sheet_names:
-                try:
-                    df = xls.parse(sheet_name)
-                    if not df.empty and df.shape[1] > 0:
-                        sheets_data[sheet_name] = df
-                except Exception:
-                    continue
+        if path.suffix.lower() in {".xlsx", ".xlsm", ".xls"}:
+            sheets_data = _read_xlsx_like_smart(path)
         else:
             df = _read_csv_smart(path)
             sheets_data = {path.stem: df}

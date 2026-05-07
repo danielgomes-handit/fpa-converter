@@ -141,6 +141,156 @@ def _read_csv_smart(path: Path, dtype=str) -> pd.DataFrame:
     )
 
 
+# =============================================================================
+# Leitura robusta de xlsx-like: detecta tipo real e trata xlsx, xls, HTML
+# disfarçado e CSV renomeado
+# =============================================================================
+
+def _detect_real_file_type(path: Path) -> str:
+    """Detecta o tipo REAL do arquivo via magic bytes (não confia na extensão).
+
+    Retorna um de: 'xlsx', 'xls', 'html', 'csv', 'unknown'.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(16)
+    except Exception:
+        return "unknown"
+
+    if not head:
+        return "unknown"
+
+    # xlsx, xlsm, docx, etc são ZIP files
+    if head.startswith(b"PK\x03\x04") or head.startswith(b"PK\x05\x06") \
+            or head.startswith(b"PK\x07\x08"):
+        return "xlsx"
+
+    # xls antigo (OLE2 Compound Document)
+    if head.startswith(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"):
+        return "xls"
+
+    # Tenta detectar texto/HTML/CSV: lê os primeiros 4 KB como texto
+    try:
+        sample = head.decode("utf-8", errors="ignore") + (
+            open(path, "r", encoding="utf-8", errors="ignore").read(4096)
+        )
+    except Exception:
+        sample = ""
+
+    sample_low = sample.lstrip().lower()
+    # HTML: começa com <html, <!doctype, <?xml + html, ou <table
+    if any(sample_low.startswith(prefix) for prefix in (
+            "<html", "<!doctype html", "<?xml", "<table", "<meta", "<head",
+            "﻿<html", "﻿<!doctype")):
+        return "html"
+    # Detecta HTML mesmo sem prefixo no início (XML/markup misturado)
+    if "<html" in sample_low[:1000] or "<table" in sample_low[:1000]:
+        return "html"
+
+    # Se chegou aqui e tem conteúdo legível, considera CSV
+    if sample.strip():
+        return "csv"
+
+    return "unknown"
+
+
+def _read_xlsx_like_smart(path: Path) -> Dict[str, pd.DataFrame]:
+    """Lê arquivo xlsx-like detectando o tipo real e usando o parser correto.
+
+    Retorna dict {sheet_name: DataFrame}. Sempre devolve pelo menos 1 sheet
+    (mesmo que o arquivo seja CSV/HTML, será envolvido em uma "aba" sintética).
+    """
+    real_type = _detect_real_file_type(path)
+
+    # 1. xlsx real → openpyxl normal
+    if real_type == "xlsx":
+        try:
+            xls = pd.ExcelFile(path, engine="openpyxl")
+            sheets = {}
+            for sn in xls.sheet_names:
+                try:
+                    df = xls.parse(sn)
+                    if not df.empty and df.shape[1] > 0:
+                        sheets[sn] = df
+                except Exception:
+                    continue
+            if sheets:
+                return sheets
+        except Exception:
+            pass  # Cai pra outras estratégias
+
+    # 2. xls antigo (binário OLE2) → xlrd
+    if real_type == "xls":
+        try:
+            xls = pd.ExcelFile(path, engine="xlrd")
+            sheets = {}
+            for sn in xls.sheet_names:
+                try:
+                    df = xls.parse(sn)
+                    if not df.empty and df.shape[1] > 0:
+                        sheets[sn] = df
+                except Exception:
+                    continue
+            if sheets:
+                return sheets
+        except Exception:
+            pass
+
+    # 3. HTML disfarçado (típico SAP/S4HANA, Mercado Pago, etc.)
+    if real_type == "html":
+        try:
+            tables = pd.read_html(path, encoding="utf-8", flavor="lxml")
+        except Exception:
+            try:
+                tables = pd.read_html(path, encoding="latin-1", flavor="lxml")
+            except Exception:
+                try:
+                    tables = pd.read_html(path)  # fallback default
+                except Exception:
+                    tables = []
+        if tables:
+            sheets = {}
+            for i, df in enumerate(tables, 1):
+                if df.empty or df.shape[1] == 0:
+                    continue
+                name = f"Tabela_{i}" if len(tables) > 1 else path.stem
+                sheets[name] = df
+            if sheets:
+                return sheets
+
+    # 4. CSV renomeado para xlsx
+    if real_type == "csv":
+        try:
+            df = _read_csv_smart(path)
+            if not df.empty and df.shape[1] > 0:
+                return {path.stem: df}
+        except Exception:
+            pass
+
+    # 5. Último fallback: tenta openpyxl mesmo se não detectou (alguns xlsx
+    # corrompidos podem não bater os magic bytes esperados)
+    try:
+        xls = pd.ExcelFile(path)
+        sheets = {}
+        for sn in xls.sheet_names:
+            try:
+                df = xls.parse(sn)
+                if not df.empty and df.shape[1] > 0:
+                    sheets[sn] = df
+            except Exception:
+                continue
+        if sheets:
+            return sheets
+    except Exception:
+        pass
+
+    raise ValueError(
+        f"Não foi possível abrir '{path.name}' como planilha. "
+        f"O arquivo aparenta ser do tipo '{real_type}' mas não pôde ser parseado. "
+        f"Verifique se é um xlsx, xls, csv ou HTML válido."
+    )
+
+
 @dataclass
 class ColumnProfile:
     name: str
@@ -195,17 +345,18 @@ def _profile_sheet(df: pd.DataFrame, sheet_name: str, n_head: int = 10) -> Sheet
 
 
 def analyze_file(path: str | Path) -> FileProfile:
-    """Lê xlsx ou csv e retorna um perfil com metadados de cada aba."""
+    """Lê xlsx, xls, csv (ou xlsx falso: HTML, xls antigo, csv renomeado).
+
+    A detecção do tipo real é feita via magic bytes pelo
+    `_read_xlsx_like_smart`, que resolve a maioria dos casos de arquivo com
+    extensão errada (.xlsx que na verdade é xls/HTML/csv).
+    """
     path = Path(path)
     sheets: List[SheetProfile] = []
 
-    if path.suffix.lower() in {".xlsx", ".xlsm"}:
-        xls = pd.ExcelFile(path)
-        for sheet_name in xls.sheet_names:
-            try:
-                df = xls.parse(sheet_name)
-            except Exception:
-                continue
+    if path.suffix.lower() in {".xlsx", ".xlsm", ".xls"}:
+        sheets_data = _read_xlsx_like_smart(path)
+        for sheet_name, df in sheets_data.items():
             if df.shape[1] == 0:
                 continue
             sheets.append(_profile_sheet(df, sheet_name))
@@ -251,8 +402,14 @@ def profile_to_prompt(profile: FileProfile, max_cols: int = 50) -> str:
 def read_sheet(path: str | Path, sheet_name: str) -> pd.DataFrame:
     """Lê uma aba específica para aplicar o mapeamento."""
     path = Path(path)
-    if path.suffix.lower() in {".xlsx", ".xlsm"}:
-        return pd.read_excel(path, sheet_name=sheet_name, dtype=str)
+    if path.suffix.lower() in {".xlsx", ".xlsm", ".xls"}:
+        sheets = _read_xlsx_like_smart(path)
+        if sheet_name in sheets:
+            return sheets[sheet_name]
+        # Sheet não encontrada: devolve a primeira disponível
+        if sheets:
+            return next(iter(sheets.values()))
+        raise ValueError(f"Aba '{sheet_name}' não encontrada em {path.name}")
     if path.suffix.lower() in {".csv", ".tsv"}:
         return _read_csv_smart(path)
     raise ValueError(f"Formato não suportado: {path.suffix}")
