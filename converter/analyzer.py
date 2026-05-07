@@ -31,6 +31,211 @@ _REPORT_NOISE_PATTERNS = re.compile(
 )
 
 
+# =============================================================================
+# Detecção de colunas e separação sintética/analítica para reduzir tokens
+# =============================================================================
+
+# Marcadores de tipo de conta usados por diferentes ERPs.
+# Cada par é (rótulos_sintética, rótulos_analítica) — todos em lower.
+_ACCOUNT_TYPE_LABELS = [
+    ({"s"}, {"a"}),
+    ({"sintética", "sintetica", "sint"}, {"analítica", "analitica", "anal"}),
+    ({"totalizador", "totalizadora", "total"}, {"movimento", "movimentacao", "movimentação"}),
+    ({"t"}, {"m"}),
+    ({"grupo", "subgrupo"}, {"conta"}),
+    ({"1"}, {"2"}),  # Sankhya e similares
+]
+
+# Palavras-chave que indicam coluna de tipo de conta
+_TYPE_COLUMN_HINTS = re.compile(
+    r"(tipo|class[ie]|natureza\s+da\s+conta|categoria|s/a|t/m|"
+    r"sintética|analítica|sintetica|analitica|totalizador|movimento)",
+    re.IGNORECASE,
+)
+
+# Palavras-chave que indicam coluna de código contábil
+_CODE_COLUMN_HINTS = re.compile(
+    r"(classifica[çc][ãa]o|c[óo]digo\s*(cont[aá]bil|reduzid|"
+    r"da\s+conta|conta)?|cod\.?\s*(cont|conta|red)?|conta\s*cont[aá]bil|"
+    r"^cod$|^c[óo]d$|^conta$)",
+    re.IGNORECASE,
+)
+
+# Palavras-chave que indicam coluna de descrição
+_DESC_COLUMN_HINTS = re.compile(
+    r"(descri[çc][ãa]o|nome\s+(da\s+)?conta|t[íi]tulo|denomina[çc][ãa]o|^desc$)",
+    re.IGNORECASE,
+)
+
+
+def _detect_account_type_column(df: pd.DataFrame) -> tuple:
+    """Detecta uma coluna que marca sintética vs analítica.
+
+    Retorna (col_name, synth_labels_set, analytic_labels_set) ou (None, None, None).
+
+    Estratégia:
+    1. Para cada coluna, normaliza valores únicos (lowercase, strip).
+    2. Verifica se os valores únicos casam com algum par de marcadores conhecidos.
+    3. Prioriza colunas cujo nome bate com hints típicos (Tipo, Classe, etc.).
+    """
+    if df is None or df.empty:
+        return None, None, None
+
+    candidates = []
+
+    for col in df.columns:
+        try:
+            vals = df[col].dropna().astype(str).str.strip().str.lower()
+        except Exception:
+            continue
+        unique_vals = set(vals.unique())
+        # Filtra valores muito longos (provavelmente são descrições, não tipo)
+        unique_vals = {v for v in unique_vals if v and len(v) <= 30}
+        if len(unique_vals) < 2 or len(unique_vals) > 6:
+            continue
+
+        for synth_lbls, anal_lbls in _ACCOUNT_TYPE_LABELS:
+            has_synth = bool(unique_vals & synth_lbls)
+            has_anal = bool(unique_vals & anal_lbls)
+            # Tolera valores extras desde que cobrem os 2 tipos principais
+            if has_synth and has_anal:
+                # Calcula score: maior se nome da coluna bate
+                col_name_score = 1
+                if _TYPE_COLUMN_HINTS.search(str(col)):
+                    col_name_score = 5
+                # Score também aumenta se cobertura é dominante
+                covered = sum(1 for v in vals if v in synth_lbls or v in anal_lbls)
+                cov_ratio = covered / max(1, len(vals))
+                if cov_ratio < 0.7:
+                    continue  # Maioria dos valores não é S/A — provavelmente outra coluna
+                score = col_name_score + cov_ratio * 10
+                candidates.append((score, col, synth_lbls, anal_lbls))
+                break
+
+    if not candidates:
+        return None, None, None
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    _, best_col, best_synth, best_anal = candidates[0]
+    return best_col, best_synth, best_anal
+
+
+def _detect_code_column(df: pd.DataFrame) -> str:
+    """Detecta a coluna que contém o código contábil hierárquico.
+
+    Heurística: prioriza coluna cujo nome bata com hints (Classificação, Código,
+    etc.) e cujos valores tenham padrão de código pontuado/hifenizado.
+    """
+    if df is None or df.empty:
+        return None
+
+    candidates = []
+    code_pattern = re.compile(r"^[\w]+([.\-/][\w]+)+$")  # 1.1.1.01 ou 1-01-01
+
+    for col in df.columns:
+        try:
+            vals = df[col].dropna().astype(str).str.strip()
+        except Exception:
+            continue
+        if vals.empty:
+            continue
+        matches = sum(1 for v in vals if code_pattern.match(v))
+        match_ratio = matches / len(vals)
+        if match_ratio < 0.3:
+            continue
+        col_name_score = 1
+        if _CODE_COLUMN_HINTS.search(str(col)):
+            col_name_score = 5
+        score = col_name_score + match_ratio * 10
+        candidates.append((score, col))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
+
+
+def _detect_desc_column(df: pd.DataFrame, exclude: list = None) -> str:
+    """Detecta a coluna de descrição da conta. Pode receber lista de colunas a ignorar."""
+    if df is None or df.empty:
+        return None
+    exclude = set(exclude or [])
+
+    candidates = []
+    for col in df.columns:
+        if col in exclude:
+            continue
+        try:
+            vals = df[col].dropna().astype(str).str.strip()
+        except Exception:
+            continue
+        if vals.empty:
+            continue
+        # Descrição: maioria de strings com letras (não só números)
+        text_vals = sum(
+            1 for v in vals
+            if isinstance(v, str) and any(c.isalpha() for c in v) and len(v) >= 3
+        )
+        text_ratio = text_vals / len(vals)
+        if text_ratio < 0.5:
+            continue
+        # Comprimento médio: descrições têm 5-60 chars típicos
+        avg_len = vals.str.len().mean()
+        if not (4 <= avg_len <= 80):
+            continue
+        col_name_score = 1
+        if _DESC_COLUMN_HINTS.search(str(col)):
+            col_name_score = 5
+        score = col_name_score + text_ratio * 5
+        candidates.append((score, col))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
+
+
+def _detect_separator_in_codes(codes) -> str:
+    """Detecta separador hierárquico majoritário em uma série de códigos."""
+    seps = {".": 0, "-": 0, "/": 0}
+    for c in codes:
+        if not isinstance(c, str):
+            continue
+        for s in seps:
+            if s in c:
+                seps[s] += 1
+    best = max(seps, key=seps.get)
+    if seps[best] >= max(1, len(codes) * 0.3):
+        return best
+    return ""
+
+
+def _infer_synthetics_by_prefix(codes: list, sep: str) -> set:
+    """Retorna o conjunto de códigos que são sintéticos (prefixo de outros)."""
+    if not sep:
+        return set()
+    code_set = set(c for c in codes if isinstance(c, str) and c.strip())
+    synths = set()
+    for c in code_set:
+        prefix = c + sep
+        if any(o.startswith(prefix) for o in code_set if o != c):
+            synths.add(c)
+    return synths
+
+
+def _build_hierarchy_map(df: pd.DataFrame, code_col: str, desc_col: str) -> dict:
+    """Monta mapa código → descrição usando todas as linhas (synth + analytic)."""
+    mapping = {}
+    if code_col not in df.columns or desc_col not in df.columns:
+        return mapping
+    for _, row in df.iterrows():
+        cod = str(row[code_col]).strip() if pd.notna(row[code_col]) else ""
+        desc = str(row[desc_col]).strip() if pd.notna(row[desc_col]) else ""
+        if cod and desc and cod != desc:
+            mapping[cod] = desc
+    return mapping
+
+
 def _clean_dataframe_for_llm(df: pd.DataFrame) -> pd.DataFrame:
     """Remove ruído determinístico de uma planilha antes de mandar ao LLM.
 

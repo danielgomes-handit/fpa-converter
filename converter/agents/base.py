@@ -138,13 +138,14 @@ def _pdf_chunks(path: Path, pages_per_chunk: int = DEFAULT_PDF_PAGES_PER_CHUNK
     return chunks
 
 
-def _df_to_text_block(path: Path, sheet_name: str, df, range_label: str = ""
-                      ) -> Dict[str, Any]:
+def _df_to_text_block(path: Path, sheet_name: str, df, range_label: str = "",
+                      agent=None) -> Dict[str, Any]:
     """Serializa um DataFrame como bloco de texto para o LLM, após pré-filtragem.
 
-    A pré-filtragem determinística (analyzer._clean_dataframe_for_llm) remove
-    ruído típico de relatório de ERP antes da serialização, reduzindo tokens
-    e melhorando a qualidade da extração.
+    Pipeline aplicado em ordem:
+    1. _clean_dataframe_for_llm — remove ruído de relatório (genérico)
+    2. agent.pre_filter_dataframe (se houver) — separação sintética/analítica
+       e armazenamento de hierarchy_map em agent.aux_data
     """
     from ..analyzer import _clean_dataframe_for_llm
 
@@ -152,7 +153,31 @@ def _df_to_text_block(path: Path, sheet_name: str, df, range_label: str = ""
     df = _clean_dataframe_for_llm(df)
     cleaned_rows = len(df)
 
+    pre_filter_note = ""
+    if agent is not None and hasattr(agent, "pre_filter_dataframe"):
+        try:
+            df, aux = agent.pre_filter_dataframe(df)
+            if aux:
+                # Mescla o aux_data acumulado entre múltiplas abas/chunks
+                if not hasattr(agent, "aux_data") or agent.aux_data is None:
+                    agent.aux_data = {}
+                # Mapas (dicts) são mesclados; outros valores são sobrescritos
+                for k, v in aux.items():
+                    if isinstance(v, dict) and isinstance(agent.aux_data.get(k), dict):
+                        agent.aux_data[k].update(v)
+                    else:
+                        agent.aux_data[k] = v
+                if aux.get("filtered_strategy"):
+                    pre_filter_note = (
+                        f", filtrado por {aux['filtered_strategy']} "
+                        f"({aux.get('filtered_count', '?')} linhas mantidas)"
+                    )
+        except Exception:
+            pass  # Falha em pre_filter não pode quebrar o pipeline
+
+    filtered_rows = len(df)
     cols = list(df.columns)
+
     try:
         md_table = df.to_markdown(index=False)
     except (ImportError, ModuleNotFoundError):
@@ -163,9 +188,11 @@ def _df_to_text_block(path: Path, sheet_name: str, df, range_label: str = ""
     if range_label:
         sheet_line = f"## Aba: `{sheet_name}` — {range_label}\n"
     else:
-        sheet_line = f"## Aba: `{sheet_name}` ({cleaned_rows} linhas"
+        sheet_line = f"## Aba: `{sheet_name}` ({filtered_rows} linhas"
         if cleaned_rows < original_rows:
             sheet_line += f", {original_rows - cleaned_rows} de ruído removidas"
+        if pre_filter_note:
+            sheet_line += pre_filter_note
         sheet_line += ")\n"
 
     preamble = (
@@ -176,9 +203,13 @@ def _df_to_text_block(path: Path, sheet_name: str, df, range_label: str = ""
     return {"type": "text", "text": preamble + md_table}
 
 
-def _tabular_chunks(path: Path, rows_per_chunk: int = DEFAULT_TABULAR_ROWS_PER_CHUNK
-                    ) -> List[List[Dict[str, Any]]]:
-    """Divide xlsx/csv em chunks. Sempre envia conteúdo COMPLETO (não amostra)."""
+def _tabular_chunks(path: Path, rows_per_chunk: int = DEFAULT_TABULAR_ROWS_PER_CHUNK,
+                    agent=None) -> List[List[Dict[str, Any]]]:
+    """Divide xlsx/csv em chunks. Sempre envia conteúdo COMPLETO (não amostra).
+
+    Se `agent` for fornecido, aplica `agent.pre_filter_dataframe` em cada sheet
+    para reduzir tokens (ex: filtrar sintéticas no Plano de Contas).
+    """
     from ..analyzer import _read_csv_smart, _read_xlsx_like_smart
 
     try:
@@ -196,11 +227,9 @@ def _tabular_chunks(path: Path, rows_per_chunk: int = DEFAULT_TABULAR_ROWS_PER_C
     total_rows_across = sum(len(df) for df in sheets_data.values())
 
     # Caso 1: cabe num único chunk → manda o CONTEÚDO COMPLETO (todas as linhas).
-    # Antes usava _document_blocks que mandava só uma amostra de 5 linhas via
-    # profile_to_prompt — isso fazia o LLM extrair só 5 contas.
     if total_rows_across <= rows_per_chunk:
         blocks = [
-            _df_to_text_block(path, sheet_name, df)
+            _df_to_text_block(path, sheet_name, df, agent=agent)
             for sheet_name, df in sheets_data.items()
         ]
         return [blocks]
@@ -213,7 +242,9 @@ def _tabular_chunks(path: Path, rows_per_chunk: int = DEFAULT_TABULAR_ROWS_PER_C
             end = min(start + rows_per_chunk, sheet_total)
             chunk_df = df.iloc[start:end]
             range_label = f"linhas {start + 1} a {end} de {sheet_total}"
-            chunks.append([_df_to_text_block(path, sheet_name, chunk_df, range_label)])
+            chunks.append([
+                _df_to_text_block(path, sheet_name, chunk_df, range_label, agent=agent)
+            ])
 
     return chunks if chunks else [_document_blocks(path, FileKind.TABULAR_STRUCTURED)]
 
@@ -245,12 +276,16 @@ def _document_chunks(
     pdf_pages_per_chunk: int = DEFAULT_PDF_PAGES_PER_CHUNK,
     tabular_rows_per_chunk: int = DEFAULT_TABULAR_ROWS_PER_CHUNK,
     text_chars_per_chunk: int = DEFAULT_TEXT_CHARS_PER_CHUNK,
+    agent=None,
 ) -> List[List[Dict[str, Any]]]:
-    """Retorna lista de chunks (cada chunk é uma lista de blocos para o LLM)."""
+    """Retorna lista de chunks (cada chunk é uma lista de blocos para o LLM).
+
+    Se `agent` for fornecido, aplica pre_filter_dataframe em fontes tabulares.
+    """
     if file_kind in {FileKind.PDF_WITH_TEXT, FileKind.PDF_SCANNED}:
         return _pdf_chunks(path, pdf_pages_per_chunk)
     if file_kind in {FileKind.TABULAR_STRUCTURED, FileKind.TABULAR_MESSY}:
-        return _tabular_chunks(path, tabular_rows_per_chunk)
+        return _tabular_chunks(path, tabular_rows_per_chunk, agent=agent)
     if file_kind == FileKind.TEXT_FREEFORM:
         return _text_chunks(path, text_chars_per_chunk)
     return [_document_blocks(path, file_kind)]
@@ -330,6 +365,9 @@ class Agent(ABC):
         self.max_tokens = int(os.environ.get("CLAUDE_MAX_TOKENS", "32000"))
         self.log: List[Dict[str, Any]] = []
         self.progress_callback = progress_callback
+        # aux_data: contexto extra produzido por pre_filter_dataframe e
+        # consumido por post_process (ex: hierarchy_map para Plano de Contas)
+        self.aux_data: Dict[str, Any] = {}
 
     def _notify(self, label: str):
         if self.progress_callback:
@@ -355,6 +393,21 @@ class Agent(ABC):
 
     def post_process(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return records
+
+    def pre_filter_dataframe(self, df) -> tuple:
+        """Pré-filtragem específica do agente sobre o DataFrame antes do LLM.
+
+        Override por subclasses para reduzir tokens (ex: filtrar sintéticas no
+        Plano de Contas). Retorna (df_filtrado, aux_data_dict).
+
+        aux_data_dict pode conter chaves como:
+        - hierarchy_map: dict {código → descrição} para reconstrução posterior
+        - filtered_strategy: nome da estratégia usada (debug)
+        - filtered_count: total de linhas mantidas após filtro
+
+        Default: identidade. Não filtra, não produz aux_data.
+        """
+        return df, {}
 
     def extra_chunk_instruction(self) -> str:
         return ""
@@ -426,7 +479,7 @@ class Agent(ABC):
 
     def extract(self) -> List[Dict[str, Any]]:
         """Extração via chunks (na maioria dos casos, só 1 chunk = arquivo inteiro)."""
-        chunks = _document_chunks(self.source_path, self.file_kind)
+        chunks = _document_chunks(self.source_path, self.file_kind, agent=self)
         total_chunks = len(chunks)
 
         all_records: List[Dict[str, Any]] = []

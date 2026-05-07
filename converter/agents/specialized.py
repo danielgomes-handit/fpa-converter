@@ -11,7 +11,7 @@ Cada agente tem:
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Dict, List, Optional, Tuple, Type
 
 from .base import Agent
 
@@ -100,6 +100,56 @@ def _rebuild_hierarchy(
                     rec[f"{n_field_prefix}{level}_COD"] = prefix
                     if prefix in code_to_desc:
                         rec[f"{n_field_prefix}{level}_DESC"] = code_to_desc[prefix]
+
+        for level in range(1, levels + 1):
+            c = str(rec.get(f"{n_field_prefix}{level}_COD", "")).strip()
+            d = str(rec.get(f"{n_field_prefix}{level}_DESC", "")).strip()
+            if c and d == c:
+                rec[f"{n_field_prefix}{level}_DESC"] = ""
+
+        processed.append(rec)
+
+    return processed
+
+
+def _rebuild_hierarchy_with_map(
+    records: List[Dict[str, Any]],
+    code_field: str,
+    n_field_prefix: str,
+    external_code_to_desc: Dict[str, str],
+    levels: int = 5,
+) -> List[Dict[str, Any]]:
+    """Reconstrói N1..N{levels} usando um mapa externo (não derivado dos records).
+
+    Usado quando pre_filter_dataframe já produziu um hierarchy_map a partir do
+    DataFrame original (com sintéticas). Os records vindos do LLM contêm só
+    analíticas — não há filtragem de sintéticas a fazer aqui.
+    """
+    code_pattern = re.compile(r"^[\w.\-/]+$")
+    # Detecta separador a partir das chaves do mapa (mais confiável que dos records)
+    sep_codes = list(external_code_to_desc.keys())
+    sep = _detect_separator(sep_codes) if sep_codes else _detect_separator(
+        [str(r.get(code_field, "")).strip() for r in records]
+    )
+
+    processed: List[Dict[str, Any]] = []
+    for rec in records:
+        cod = str(rec.get(code_field, "")).strip()
+        if not cod:
+            continue
+
+        for level in range(1, levels + 1):
+            rec[f"{n_field_prefix}{level}_COD"] = ""
+            rec[f"{n_field_prefix}{level}_DESC"] = ""
+
+        if sep and code_pattern.match(cod) and sep in cod:
+            parts = cod.split(sep)
+            for level in range(1, levels + 1):
+                if level <= len(parts):
+                    prefix = sep.join(parts[:level])
+                    rec[f"{n_field_prefix}{level}_COD"] = prefix
+                    if prefix in external_code_to_desc:
+                        rec[f"{n_field_prefix}{level}_DESC"] = external_code_to_desc[prefix]
 
         for level in range(1, levels + 1):
             c = str(rec.get(f"{n_field_prefix}{level}_COD", "")).strip()
@@ -350,6 +400,19 @@ class PlanoDeContasAgent(Agent):
         )
 
     def extra_chunk_instruction(self) -> str:
+        # Se rodou pre_filter (caminho 1 ou 2), o LLM só vê analíticas e a
+        # hierarquia já está garantida pelo Python. Instrução fica mais simples.
+        if self.aux_data.get("filtered_strategy") in {"type_column", "prefix_inference"}:
+            return (
+                "✓ Este input já foi pré-filtrado: contém APENAS contas analíticas "
+                "(folha da hierarquia, recebem lançamento). Você não precisa se "
+                "preocupar com sintéticas — a hierarquia CONTA_N1..N5 será "
+                "reconstruída automaticamente em pós-processamento. "
+                "Foque em extrair cada linha como uma analítica, com naturezas "
+                "D/C corretas e DRE_N1 quando aplicável."
+            )
+
+        # Caminho 3 (sem otimização): mantém a instrução completa
         return (
             "⚠️ REFORÇO SOBRE SINTÉTICAS (muito importante):\n"
             "Em CADA parte/chunk do documento que você processar, SEMPRE inclua como "
@@ -369,20 +432,121 @@ class PlanoDeContasAgent(Agent):
             "linha com o código mesmo assim."
         )
 
+    def pre_filter_dataframe(self, df) -> Tuple[Any, Dict[str, Any]]:
+        """Pré-filtra sintéticas no Python para reduzir tokens enviados ao LLM.
+
+        Estratégia híbrida com 3 caminhos:
+        1. Coluna 'Tipo' detectada (S/A, T/M, Sintética/Analítica) → filtra direto
+        2. Inferência por prefixo (sem coluna Tipo, mas hierarquia clara) → infere
+        3. Sem confiança → fallback ao caminho atual (devolve df sem filtrar)
+
+        Em qualquer caminho de sucesso, popula:
+        - hierarchy_map: dict {código → descrição} construído de TODAS as linhas
+        - filtered_strategy: nome do caminho usado
+        - filtered_count: nº de linhas mantidas
+        """
+        from ..analyzer import (
+            _detect_account_type_column,
+            _detect_code_column,
+            _detect_desc_column,
+            _detect_separator_in_codes,
+            _infer_synthetics_by_prefix,
+            _build_hierarchy_map,
+        )
+
+        if df is None or df.empty:
+            return df, {}
+
+        # Caminho 1: existe uma coluna que marca tipo (S/A, T/M, etc)?
+        type_col, synth_lbls, anal_lbls = _detect_account_type_column(df)
+
+        # Detecta código + descrição (precisa para construir hierarchy_map)
+        code_col = _detect_code_column(df)
+        desc_col = _detect_desc_column(df, exclude=[code_col, type_col] if code_col else [type_col])
+
+        if not code_col or not desc_col:
+            # Sem identificação confiável, deixa o LLM lidar
+            return df, {}
+
+        if type_col is not None:
+            try:
+                vals_lower = df[type_col].dropna().astype(str).str.strip().str.lower()
+                synth_mask = df[type_col].astype(str).str.strip().str.lower().isin(synth_lbls)
+                analytic_mask = df[type_col].astype(str).str.strip().str.lower().isin(anal_lbls)
+                n_synth = int(synth_mask.sum())
+                n_analytic = int(analytic_mask.sum())
+                # Só usa caminho 1 se houver quantidade significativa de cada
+                if n_synth >= 1 and n_analytic >= 5:
+                    hier_map = _build_hierarchy_map(df, code_col, desc_col)
+                    df_analytic = df[analytic_mask].reset_index(drop=True)
+                    return df_analytic, {
+                        "hierarchy_map": hier_map,
+                        "filtered_strategy": "type_column",
+                        "filtered_count": len(df_analytic),
+                        "type_column_used": str(type_col),
+                        "code_column_used": str(code_col),
+                        "desc_column_used": str(desc_col),
+                    }
+            except Exception:
+                pass
+
+        # Caminho 2: infere sintéticas por prefixo no código
+        try:
+            codes = df[code_col].dropna().astype(str).str.strip().tolist()
+            sep = _detect_separator_in_codes(codes)
+            if sep:
+                synthetic_codes = _infer_synthetics_by_prefix(codes, sep)
+                if len(synthetic_codes) >= 5:
+                    hier_map = _build_hierarchy_map(df, code_col, desc_col)
+                    code_str = df[code_col].astype(str).str.strip()
+                    df_analytic = df[~code_str.isin(synthetic_codes)].reset_index(drop=True)
+                    if len(df_analytic) >= 5:
+                        return df_analytic, {
+                            "hierarchy_map": hier_map,
+                            "filtered_strategy": "prefix_inference",
+                            "filtered_count": len(df_analytic),
+                            "code_column_used": str(code_col),
+                            "desc_column_used": str(desc_col),
+                            "synthetic_count_inferred": len(synthetic_codes),
+                        }
+        except Exception:
+            pass
+
+        # Caminho 3: nenhuma confiança suficiente → fallback (comportamento atual)
+        return df, {}
+
     def post_process(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Pós-processamento determinístico após extração do Claude.
 
-        Estratégia: o Claude extrai TODAS as contas (sintéticas + analíticas).
-        Aqui filtramos as sintéticas e reconstruímos CONTA_N1..N5 a partir do
-        código da analítica + descrições coletadas.
+        Dois fluxos:
+        - Se pre_filter_dataframe rodou (caminhos 1/2): usa hierarchy_map já
+          construído do DataFrame original para reconstruir CONTA_N1..N5.
+          Sintéticas já não estão em `records`, então não precisa filtrar.
+        - Senão (caminho 3): usa lógica de _rebuild_hierarchy padrão (filtra
+          sintéticas dos próprios records e reconstrói).
         """
-        processed = _rebuild_hierarchy(
-            records,
-            code_field="CONTA_CONTABIL_COD",
-            desc_field="CONTA_CONTABIL_DESC",
-            n_field_prefix="CONTA_N",
-            levels=5,
-        )
+        hierarchy_map = self.aux_data.get("hierarchy_map") if self.aux_data else None
+
+        if hierarchy_map:
+            # Caminho 1/2: pre_filter já cuidou da separação. Usa o mapa pré-construído.
+            processed = _rebuild_hierarchy_with_map(
+                records,
+                code_field="CONTA_CONTABIL_COD",
+                n_field_prefix="CONTA_N",
+                external_code_to_desc=hierarchy_map,
+                levels=5,
+            )
+        else:
+            # Caminho 3: comportamento original (filtra sintéticas dos records,
+            # reconstrói usando descrições do próprio LLM).
+            processed = _rebuild_hierarchy(
+                records,
+                code_field="CONTA_CONTABIL_COD",
+                desc_field="CONTA_CONTABIL_DESC",
+                n_field_prefix="CONTA_N",
+                levels=5,
+            )
+
         # CONTA_CONTABIL_CLASS: se vazio, usa o próprio COD
         for rec in processed:
             cod = str(rec.get("CONTA_CONTABIL_COD", "")).strip()
