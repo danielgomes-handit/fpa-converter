@@ -194,6 +194,72 @@ def _detect_real_file_type(path: Path) -> str:
     return "unknown"
 
 
+def _read_zip_fallback(path: Path) -> Dict[str, pd.DataFrame]:
+    """Tenta extrair tabelas de um zip-like que NÃO é xlsx OOXML padrão.
+
+    Casos cobertos:
+    - Zips com CSV/TSV dentro (ERPs que exportam dados em zip)
+    - Zips com HTML dentro
+    - Zips com XML do tipo SpreadsheetML 2003 (Microsoft Office XML antigo)
+    """
+    import zipfile
+
+    sheets: Dict[str, pd.DataFrame] = {}
+    try:
+        with zipfile.ZipFile(path) as zf:
+            names = zf.namelist()
+            for name in names:
+                lower = name.lower()
+                if lower.endswith("/") or lower.startswith("__macosx/"):
+                    continue
+                try:
+                    with zf.open(name) as inner:
+                        data = inner.read()
+                except Exception:
+                    continue
+
+                # Tenta CSV
+                if lower.endswith((".csv", ".tsv", ".txt")):
+                    try:
+                        from io import BytesIO
+                        sep = "\t" if lower.endswith(".tsv") else ","
+                        df = pd.read_csv(BytesIO(data), sep=sep, dtype=str,
+                                          encoding_errors="replace")
+                        if not df.empty and df.shape[1] > 0:
+                            sheets[Path(name).stem] = df
+                    except Exception:
+                        pass
+
+                # Tenta HTML (típico de exports SAP)
+                elif lower.endswith((".html", ".htm", ".xhtml")):
+                    try:
+                        from io import BytesIO
+                        tabs = pd.read_html(BytesIO(data))
+                        for i, df in enumerate(tabs, 1):
+                            if not df.empty and df.shape[1] > 0:
+                                key = f"{Path(name).stem}_t{i}" if len(tabs) > 1 else Path(name).stem
+                                sheets[key] = df
+                    except Exception:
+                        pass
+
+                # Tenta SpreadsheetML 2003 (Microsoft Office XML antigo)
+                elif lower.endswith(".xml") and "workbook" not in lower:
+                    text = data.decode("utf-8", errors="ignore")
+                    if "<Worksheet" in text or "<Table" in text:
+                        try:
+                            from io import StringIO
+                            tabs = pd.read_html(StringIO(text))
+                            for i, df in enumerate(tabs, 1):
+                                if not df.empty and df.shape[1] > 0:
+                                    sheets[f"{Path(name).stem}_t{i}"] = df
+                        except Exception:
+                            pass
+    except zipfile.BadZipFile:
+        pass
+
+    return sheets
+
+
 def _read_xlsx_like_smart(path: Path) -> Dict[str, pd.DataFrame]:
     """Lê arquivo xlsx-like detectando o tipo real e usando o parser correto.
 
@@ -218,6 +284,12 @@ def _read_xlsx_like_smart(path: Path) -> Dict[str, pd.DataFrame]:
                 return sheets
         except Exception:
             pass  # Cai pra outras estratégias
+
+        # 1b. É um zip mas openpyxl falhou (xlsx não-padrão / corrompido) →
+        # tenta extrair conteúdo do zip diretamente
+        sheets = _read_zip_fallback(path)
+        if sheets:
+            return sheets
 
     # 2. xls antigo (binário OLE2) → xlrd
     if real_type == "xls":
@@ -284,10 +356,25 @@ def _read_xlsx_like_smart(path: Path) -> Dict[str, pd.DataFrame]:
     except Exception:
         pass
 
+    # Diagnóstico final: se for um zip, lista o conteúdo pra ajudar a entender
+    extra_info = ""
+    if real_type == "xlsx":
+        try:
+            import zipfile
+            with zipfile.ZipFile(path) as zf:
+                names = zf.namelist()[:15]
+            extra_info = (
+                f" Conteúdo do zip (primeiros 15 itens): {names}. "
+                f"Esperava 'xl/workbook.xml' (formato OOXML/Excel padrão)."
+            )
+        except Exception:
+            extra_info = " O arquivo aparenta ser um ZIP, mas não pôde ser aberto."
+
     raise ValueError(
         f"Não foi possível abrir '{path.name}' como planilha. "
-        f"O arquivo aparenta ser do tipo '{real_type}' mas não pôde ser parseado. "
-        f"Verifique se é um xlsx, xls, csv ou HTML válido."
+        f"Tipo detectado: '{real_type}'.{extra_info} "
+        f"Tente abrir o arquivo no Excel e salvar como xlsx (Salvar como → "
+        f"Pasta de Trabalho do Excel .xlsx) ou exportar como CSV."
     )
 
 
