@@ -95,8 +95,11 @@ def _document_blocks(path: Path, file_kind: FileKind) -> List[Dict[str, Any]]:
 
 # Defaults pensados para Opus 4.7 via OpenRouter (output ~32k tokens, contexto 200k).
 # Para a maioria dos arquivos do dia a dia, NÃO há chunking — vai tudo de uma vez.
+# Tabular: 1500 linhas/chunk cobre planos de contas grandes (Datasul, setor
+# público) em 1 chamada só. A contagem é feita APÓS pre_filter (sintéticas
+# já filtradas), então o limite efetivo é por linhas analíticas.
 DEFAULT_PDF_PAGES_PER_CHUNK = int(os.environ.get("CHUNK_PDF_PAGES", "30"))
-DEFAULT_TABULAR_ROWS_PER_CHUNK = int(os.environ.get("CHUNK_TABULAR_ROWS", "600"))
+DEFAULT_TABULAR_ROWS_PER_CHUNK = int(os.environ.get("CHUNK_TABULAR_ROWS", "1500"))
 DEFAULT_TEXT_CHARS_PER_CHUNK = int(os.environ.get("CHUNK_TEXT_CHARS", "100000"))
 
 
@@ -139,43 +142,13 @@ def _pdf_chunks(path: Path, pages_per_chunk: int = DEFAULT_PDF_PAGES_PER_CHUNK
 
 
 def _df_to_text_block(path: Path, sheet_name: str, df, range_label: str = "",
-                      agent=None) -> Dict[str, Any]:
-    """Serializa um DataFrame como bloco de texto para o LLM, após pré-filtragem.
+                      meta_note: str = "") -> Dict[str, Any]:
+    """Serializa um DataFrame como bloco de texto markdown/CSV para o LLM.
 
-    Pipeline aplicado em ordem:
-    1. _clean_dataframe_for_llm — remove ruído de relatório (genérico)
-    2. agent.pre_filter_dataframe (se houver) — separação sintética/analítica
-       e armazenamento de hierarchy_map em agent.aux_data
+    Esta é apenas a camada de SERIALIZAÇÃO. A limpeza determinística
+    (_clean_dataframe_for_llm) e a pré-filtragem por agente
+    (agent.pre_filter_dataframe) já devem ter sido aplicadas antes.
     """
-    from ..analyzer import _clean_dataframe_for_llm
-
-    original_rows = len(df)
-    df = _clean_dataframe_for_llm(df)
-    cleaned_rows = len(df)
-
-    pre_filter_note = ""
-    if agent is not None and hasattr(agent, "pre_filter_dataframe"):
-        try:
-            df, aux = agent.pre_filter_dataframe(df)
-            if aux:
-                # Mescla o aux_data acumulado entre múltiplas abas/chunks
-                if not hasattr(agent, "aux_data") or agent.aux_data is None:
-                    agent.aux_data = {}
-                # Mapas (dicts) são mesclados; outros valores são sobrescritos
-                for k, v in aux.items():
-                    if isinstance(v, dict) and isinstance(agent.aux_data.get(k), dict):
-                        agent.aux_data[k].update(v)
-                    else:
-                        agent.aux_data[k] = v
-                if aux.get("filtered_strategy"):
-                    pre_filter_note = (
-                        f", filtrado por {aux['filtered_strategy']} "
-                        f"({aux.get('filtered_count', '?')} linhas mantidas)"
-                    )
-        except Exception:
-            pass  # Falha em pre_filter não pode quebrar o pipeline
-
-    filtered_rows = len(df)
     cols = list(df.columns)
 
     try:
@@ -188,12 +161,7 @@ def _df_to_text_block(path: Path, sheet_name: str, df, range_label: str = "",
     if range_label:
         sheet_line = f"## Aba: `{sheet_name}` — {range_label}\n"
     else:
-        sheet_line = f"## Aba: `{sheet_name}` ({filtered_rows} linhas"
-        if cleaned_rows < original_rows:
-            sheet_line += f", {original_rows - cleaned_rows} de ruído removidas"
-        if pre_filter_note:
-            sheet_line += pre_filter_note
-        sheet_line += ")\n"
+        sheet_line = f"## Aba: `{sheet_name}` ({len(df)} linhas{meta_note})\n"
 
     preamble = (
         f"# Arquivo: `{path.name}`\n"
@@ -203,12 +171,71 @@ def _df_to_text_block(path: Path, sheet_name: str, df, range_label: str = "",
     return {"type": "text", "text": preamble + md_table}
 
 
+def _prepare_sheets_for_agent(sheets_data, agent):
+    """Aplica clean + pre_filter UMA VEZ por sheet, antes de qualquer chunking.
+
+    Garante que:
+    - O hierarchy_map é construído do dataframe completo (não fragmentado)
+    - A contagem de linhas para decidir chunkar é a do df pré-filtrado
+    - aux_data do agente fica populado antes da extração começar
+
+    Retorna (sheets_processadas, meta_dict) onde meta_dict tem informações
+    para o preamble (linhas removidas, estratégia de filtro).
+    """
+    from ..analyzer import _clean_dataframe_for_llm
+
+    processed = {}
+    notes = {}
+    for sheet_name, df in sheets_data.items():
+        original_rows = len(df)
+        df = _clean_dataframe_for_llm(df)
+        cleaned_rows = len(df)
+
+        filter_note = ""
+        if agent is not None and hasattr(agent, "pre_filter_dataframe"):
+            try:
+                df, aux = agent.pre_filter_dataframe(df)
+                if aux:
+                    if not hasattr(agent, "aux_data") or agent.aux_data is None:
+                        agent.aux_data = {}
+                    for k, v in aux.items():
+                        if isinstance(v, dict) and isinstance(agent.aux_data.get(k), dict):
+                            agent.aux_data[k].update(v)
+                        else:
+                            agent.aux_data[k] = v
+                    if aux.get("filtered_strategy"):
+                        filter_note = (
+                            f", filtrado por {aux['filtered_strategy']} "
+                            f"({aux.get('filtered_count', len(df))} linhas mantidas)"
+                        )
+            except Exception:
+                pass
+
+        processed[sheet_name] = df
+        # Compõe a "meta_note" para o preamble do bloco
+        meta = ""
+        if cleaned_rows < original_rows:
+            meta += f", {original_rows - cleaned_rows} de ruído removidas"
+        meta += filter_note
+        notes[sheet_name] = meta
+
+    return processed, notes
+
+
 def _tabular_chunks(path: Path, rows_per_chunk: int = DEFAULT_TABULAR_ROWS_PER_CHUNK,
                     agent=None) -> List[List[Dict[str, Any]]]:
-    """Divide xlsx/csv em chunks. Sempre envia conteúdo COMPLETO (não amostra).
+    """Divide xlsx/csv em chunks após aplicar clean + pre_filter UMA VEZ.
 
-    Se `agent` for fornecido, aplica `agent.pre_filter_dataframe` em cada sheet
-    para reduzir tokens (ex: filtrar sintéticas no Plano de Contas).
+    Ordem importante:
+    1. Lê o arquivo (todas as sheets)
+    2. Aplica _clean_dataframe_for_llm + agent.pre_filter_dataframe em cada sheet
+       (UMA vez, antes de qualquer chunking) → constrói hierarchy_map completo
+    3. SÓ ENTÃO decide chunkar baseado no tamanho do df pré-filtrado
+
+    Isso garante:
+    - hierarchy_map é completo (vê todas as linhas, não pedaços)
+    - Decisão de chunkar usa contagem real (após filtro de sintéticas)
+    - pre_filter roda 1x por sheet, não 1x por chunk
     """
     from ..analyzer import _read_csv_smart, _read_xlsx_like_smart
 
@@ -224,17 +251,25 @@ def _tabular_chunks(path: Path, rows_per_chunk: int = DEFAULT_TABULAR_ROWS_PER_C
     if not sheets_data:
         return [_document_blocks(path, FileKind.TABULAR_STRUCTURED)]
 
+    # Etapa crítica: clean + pre_filter ANTES da decisão de chunkar
+    sheets_data, sheet_notes = _prepare_sheets_for_agent(sheets_data, agent)
+
     total_rows_across = sum(len(df) for df in sheets_data.values())
 
     # Caso 1: cabe num único chunk → manda o CONTEÚDO COMPLETO (todas as linhas).
     if total_rows_across <= rows_per_chunk:
         blocks = [
-            _df_to_text_block(path, sheet_name, df, agent=agent)
+            _df_to_text_block(
+                path, sheet_name, df,
+                meta_note=sheet_notes.get(sheet_name, ""),
+            )
             for sheet_name, df in sheets_data.items()
         ]
         return [blocks]
 
     # Caso 2: muito grande → fragmenta em pedaços de rows_per_chunk linhas
+    # IMPORTANTE: aux_data (hierarchy_map) já foi construído com df completo,
+    # então mesmo chunkando, post_process tem a hierarquia correta.
     chunks: List[List[Dict[str, Any]]] = []
     for sheet_name, df in sheets_data.items():
         sheet_total = len(df)
@@ -243,7 +278,7 @@ def _tabular_chunks(path: Path, rows_per_chunk: int = DEFAULT_TABULAR_ROWS_PER_C
             chunk_df = df.iloc[start:end]
             range_label = f"linhas {start + 1} a {end} de {sheet_total}"
             chunks.append([
-                _df_to_text_block(path, sheet_name, chunk_df, range_label, agent=agent)
+                _df_to_text_block(path, sheet_name, chunk_df, range_label=range_label)
             ])
 
     return chunks if chunks else [_document_blocks(path, FileKind.TABULAR_STRUCTURED)]
