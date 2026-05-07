@@ -194,15 +194,108 @@ def _detect_real_file_type(path: Path) -> str:
     return "unknown"
 
 
+# Stylesheet OOXML mínimo válido — usado como substituto para styles
+# malformados em xlsx gerados por ERPs antigos.
+_MINIMAL_STYLES_XML = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+    '<fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>'
+    '<fills count="1"><fill><patternFill patternType="none"/></fill></fills>'
+    '<borders count="1"><border/></borders>'
+    '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+    '<cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs>'
+    '</styleSheet>'
+).encode("utf-8")
+
+
+def _repair_xlsx(path: Path) -> Path | None:
+    """Tenta consertar xlsx malformados gerados por ERPs (Datasul, Protheus, etc).
+
+    Cobre os dois bugs mais comuns:
+    1. Paths internos com `\\` em vez de `/` (viola padrão OOXML/ZIP)
+    2. `xl/styles.xml` malformado (Border.left como string em vez de objeto Side)
+
+    Retorna o path de um arquivo temporário "consertado", ou None se o arquivo
+    estiver OK ou não puder ser consertado.
+    """
+    import zipfile
+    import tempfile
+
+    try:
+        with zipfile.ZipFile(path) as zf:
+            names = zf.namelist()
+    except zipfile.BadZipFile:
+        return None
+
+    # Sempre regrava normalizando paths E substituindo styles (operação barata
+    # e idempotente). Se o arquivo estava OK, ainda assim funciona.
+    has_problem = (
+        any("\\" in n for n in names)
+        or any(n.replace("\\", "/").endswith("xl/styles.xml") for n in names)
+    )
+    if not has_problem:
+        return None
+
+    fixed = Path(tempfile.mktemp(suffix=".xlsx"))
+    try:
+        with zipfile.ZipFile(path) as zin, \
+                zipfile.ZipFile(fixed, "w", zipfile.ZIP_DEFLATED) as zout:
+            for info in zin.infolist():
+                fixed_name = info.filename.replace("\\", "/")
+                # Substitui styles.xml por versão mínima válida
+                if fixed_name == "xl/styles.xml":
+                    data = _MINIMAL_STYLES_XML
+                else:
+                    data = zin.read(info.filename)
+                new_info = zipfile.ZipInfo(
+                    filename=fixed_name,
+                    date_time=info.date_time,
+                )
+                new_info.compress_type = zipfile.ZIP_DEFLATED
+                zout.writestr(new_info, data)
+        return fixed
+    except Exception:
+        try:
+            fixed.unlink()
+        except Exception:
+            pass
+        return None
+
+
 def _read_zip_fallback(path: Path) -> Dict[str, pd.DataFrame]:
     """Tenta extrair tabelas de um zip-like que NÃO é xlsx OOXML padrão.
 
     Casos cobertos:
+    - xlsx mal formado com `\\` em vez de `/` nos paths (Datasul/Protheus etc.)
     - Zips com CSV/TSV dentro (ERPs que exportam dados em zip)
     - Zips com HTML dentro
     - Zips com XML do tipo SpreadsheetML 2003 (Microsoft Office XML antigo)
     """
     import zipfile
+
+    # 0. Tenta consertar bugs comuns do xlsx (Datasul/Protheus/ERPs antigos):
+    #    paths com backslash, styles.xml malformado, etc.
+    fixed_path = _repair_xlsx(path)
+    if fixed_path:
+        try:
+            xls = pd.ExcelFile(fixed_path, engine="openpyxl")
+            sheets = {}
+            for sn in xls.sheet_names:
+                try:
+                    df = xls.parse(sn)
+                    if not df.empty and df.shape[1] > 0:
+                        sheets[sn] = df
+                except Exception:
+                    continue
+            if sheets:
+                return sheets
+        except Exception:
+            pass
+        finally:
+            try:
+                fixed_path.unlink()
+            except Exception:
+                pass
 
     sheets: Dict[str, pd.DataFrame] = {}
     try:
