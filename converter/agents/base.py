@@ -140,7 +140,18 @@ def _pdf_chunks(path: Path, pages_per_chunk: int = DEFAULT_PDF_PAGES_PER_CHUNK
 
 def _df_to_text_block(path: Path, sheet_name: str, df, range_label: str = ""
                       ) -> Dict[str, Any]:
-    """Serializa um DataFrame inteiro como bloco de texto markdown/CSV para o LLM."""
+    """Serializa um DataFrame como bloco de texto para o LLM, após pré-filtragem.
+
+    A pré-filtragem determinística (analyzer._clean_dataframe_for_llm) remove
+    ruído típico de relatório de ERP antes da serialização, reduzindo tokens
+    e melhorando a qualidade da extração.
+    """
+    from ..analyzer import _clean_dataframe_for_llm
+
+    original_rows = len(df)
+    df = _clean_dataframe_for_llm(df)
+    cleaned_rows = len(df)
+
     cols = list(df.columns)
     try:
         md_table = df.to_markdown(index=False)
@@ -152,7 +163,10 @@ def _df_to_text_block(path: Path, sheet_name: str, df, range_label: str = ""
     if range_label:
         sheet_line = f"## Aba: `{sheet_name}` — {range_label}\n"
     else:
-        sheet_line = f"## Aba: `{sheet_name}` ({len(df)} linhas)\n"
+        sheet_line = f"## Aba: `{sheet_name}` ({cleaned_rows} linhas"
+        if cleaned_rows < original_rows:
+            sheet_line += f", {original_rows - cleaned_rows} de ruído removidas"
+        sheet_line += ")\n"
 
     preamble = (
         f"# Arquivo: `{path.name}`\n"

@@ -5,11 +5,113 @@ sem precisar enviar o arquivo inteiro (o que seria caro e lento).
 """
 
 import csv as _csv
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List
 
 import pandas as pd
+
+
+# =============================================================================
+# Pré-filtragem determinística antes de enviar ao LLM
+# =============================================================================
+
+# Padrões típicos de cabeçalho/rodapé de relatório de ERP (Datasul, Protheus,
+# SAP, S/4HANA). Linhas que casam são removidas porque não fazem parte dos
+# dados reais — são metadados de impressão.
+_REPORT_NOISE_PATTERNS = re.compile(
+    r"(\bp(á|a)g\.?\s*:?\s*\d|\bp(á|a)gina\s+\d|"
+    r"\busu(á|a)rio\s*:|\buser\s*:|"
+    r"\bhora\s*:|\bdata\s+(de\s+)?emiss(ã|a)o|\bemit(ido|\.)?\s+em|"
+    r"\brelat(ó|o)rio\s*:|\bimpress(ã|a)o|\bcontinua\.{2,}|\b\.{2,}continua|"
+    r"\btotal\s+geral|\bsubtotal|"
+    r"\bdsmp\d|\bsige\s|\b\d+/\d+/\d{4}\s+\d+:\d+\b)",
+    re.IGNORECASE,
+)
+
+
+def _clean_dataframe_for_llm(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove ruído determinístico de uma planilha antes de mandar ao LLM.
+
+    Reduz o consumo de tokens e melhora a qualidade da extração ao tirar do
+    input partes do arquivo que claramente NÃO são dados úteis:
+
+    1. Colunas com >=95% de células vazias (cabeçalho de relatório do ERP).
+    2. Linhas totalmente vazias.
+    3. Header real quando o pandas pegou uma linha errada (caso típico de
+       relatório do Datasul/Protheus que tem título e cabeçalho de página).
+    4. Linhas com padrões de rodapé/cabeçalho de relatório ('Pág.:',
+       'Usuário:', 'DSMP001', 'Data emissão', etc.).
+
+    A função é segura: se algo der errado em qualquer etapa, devolve o df
+    parcialmente limpo (não derruba o pipeline).
+    """
+    if df is None or df.empty:
+        return df
+
+    try:
+        df = df.copy()
+
+        # 1) Remove colunas quase vazias (>=95% NaN).
+        threshold = max(1, int(len(df) * 0.05))
+        df = df.dropna(axis=1, thresh=threshold)
+        if df.empty or df.shape[1] == 0:
+            return df
+
+        # 2) Remove linhas totalmente vazias.
+        df = df.dropna(how="all").reset_index(drop=True)
+        if df.empty:
+            return df
+
+        # 3) Detecta header em linha errada e promove se necessário.
+        cols = [str(c) for c in df.columns]
+        unnamed_ratio = sum(
+            1 for c in cols
+            if c.startswith("Unnamed") or c.strip().isdigit() or not c.strip()
+        ) / max(1, len(cols))
+
+        if unnamed_ratio >= 0.4:
+            for i in range(min(8, len(df))):
+                row = df.iloc[i]
+                non_null = row.dropna()
+                if len(non_null) < 3:
+                    continue
+                # Linha-cabeçalho típica: maioria de strings curtas sem dígitos
+                string_cells = [str(v) for v in non_null if isinstance(v, str)]
+                looks_header = sum(
+                    1 for s in string_cells
+                    if 2 <= len(s) <= 30
+                    and not s.replace(".", "").replace(",", "").isdigit()
+                )
+                if looks_header >= len(non_null) * 0.5:
+                    new_cols = []
+                    for j in range(len(df.columns)):
+                        val = df.iloc[i, j]
+                        if pd.notna(val) and str(val).strip():
+                            new_cols.append(str(val).strip())
+                        else:
+                            new_cols.append(f"col_{j}")
+                    df.columns = new_cols
+                    df = df.iloc[i + 1:].reset_index(drop=True)
+                    break
+
+        # 4) Remove linhas de rodapé/metadados do relatório.
+        if not df.empty:
+            def _is_noise(row):
+                text = " ".join(str(v) for v in row if pd.notna(v))
+                if not text.strip():
+                    return True
+                return bool(_REPORT_NOISE_PATTERNS.search(text))
+
+            mask = ~df.apply(_is_noise, axis=1)
+            df = df[mask].reset_index(drop=True)
+
+        return df
+
+    except Exception:
+        # Se qualquer etapa falhar, devolve o que tem (não bloqueia o pipeline).
+        return df
 
 
 # =============================================================================
